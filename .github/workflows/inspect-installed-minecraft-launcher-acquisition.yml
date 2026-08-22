@@ -58,7 +58,6 @@ jobs:
           Write-Host "INSTALLER_SHA256=$hash"
           Write-Host "SIGNATURE_STATUS=$($sig.Status)"
           Write-Host "SIGNER=$($sig.SignerCertificate.Subject)"
-          Write-Host "SIGNER_ISSUER=$($sig.SignerCertificate.Issuer)"
           Write-Host "FILE_VERSION=$($item.VersionInfo.FileVersion)"
           Write-Host "PRODUCT=$($item.VersionInfo.ProductName)"
 
@@ -68,7 +67,7 @@ jobs:
 
           "INSTALLER_PATH=$installer" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Probe installer UI and optionally attempt official Launcher install
+      - name: Accept EULA and attempt install without Store sign-in automation
         shell: pwsh
         env:
           ACCEPT_LAUNCHER_EULA: ${{ inputs.accept_launcher_eula }}
@@ -81,67 +80,50 @@ jobs:
               Select-Object -First 1
           }
 
-          function Stop-MinecraftInstaller {
-            Get-Process -Name MinecraftInstaller -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          function Stop-Installer {
+            Get-Process -Name MinecraftInstaller -ErrorAction SilentlyContinue |
+              Stop-Process -Force -ErrorAction SilentlyContinue
           }
 
-          $uiaAvailable = $true
-          try {
-            Add-Type -AssemblyName UIAutomationClient
-            Add-Type -AssemblyName UIAutomationTypes
-          } catch {
-            $uiaAvailable = $false
-            Write-Host "UI_AUTOMATION_AVAILABLE=false"
-            Write-Host "UI_AUTOMATION_ERROR=$($_.Exception.Message)"
-          }
+          Add-Type -AssemblyName UIAutomationClient
+          Add-Type -AssemblyName UIAutomationTypes
 
-          function Get-InstallerElements([int]$processId) {
-            if (-not $uiaAvailable) { return @() }
-            try {
-              $root = [System.Windows.Automation.AutomationElement]::RootElement
-              $condition = New-Object System.Windows.Automation.PropertyCondition(
-                [System.Windows.Automation.AutomationElement]::ProcessIdProperty,
-                $processId
-              )
-              $collection = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
-              $items = @()
-              for ($i = 0; $i -lt $collection.Count; $i++) {
-                $el = $collection.Item($i)
-                try {
-                  $items += [pscustomobject]@{
-                    Element = $el
-                    Name = $el.Current.Name
-                    AutomationId = $el.Current.AutomationId
-                    ControlType = $el.Current.ControlType.ProgrammaticName
-                    Enabled = $el.Current.IsEnabled
-                  }
-                } catch {}
-              }
-              return $items
-            } catch {
-              Write-Host "UI_TREE_ERROR=$($_.Exception.Message)"
-              return @()
+          function Get-Elements([int]$processId) {
+            $root = [System.Windows.Automation.AutomationElement]::RootElement
+            $condition = New-Object System.Windows.Automation.PropertyCondition(
+              [System.Windows.Automation.AutomationElement]::ProcessIdProperty,
+              $processId
+            )
+            $collection = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+            $items = @()
+            for ($i = 0; $i -lt $collection.Count; $i++) {
+              $el = $collection.Item($i)
+              try {
+                $items += [pscustomobject]@{
+                  Element = $el
+                  Name = $el.Current.Name
+                  AutomationId = $el.Current.AutomationId
+                  ControlType = $el.Current.ControlType.ProgrammaticName
+                  Enabled = $el.Current.IsEnabled
+                }
+              } catch {}
             }
-          }
-
-          function Dump-InstallerUI([int]$processId, [string]$label) {
-            Write-Host "=== INSTALLER UI: $label ==="
-            $items = Get-InstallerElements $processId
-            Write-Host "UI_ELEMENT_COUNT=$($items.Count)"
-            $items |
-              Where-Object { $_.Name -or $_.AutomationId } |
-              Select-Object -First 180 |
-              ForEach-Object {
-                $safeName = ($_.Name -replace "`r|`n", ' ')
-                Write-Host "UI CONTROL=$($_.ControlType) ENABLED=$($_.Enabled) ID=[$($_.AutomationId)] NAME=[$safeName]"
-              }
             return $items
           }
 
-          $before = Get-LauncherPackage
-          if ($before) {
+          function Dump-UI([int]$processId, [string]$label) {
+            Write-Host "=== INSTALLER UI: $label ==="
+            $items = Get-Elements $processId
+            Write-Host "UI_ELEMENT_COUNT=$($items.Count)"
+            $items | Where-Object { $_.Name -or $_.AutomationId } | Select-Object -First 200 | ForEach-Object {
+              $safe = ($_.Name -replace "`r|`n", ' ')
+              Write-Host "UI CONTROL=$($_.ControlType) ENABLED=$($_.Enabled) ID=[$($_.AutomationId)] NAME=[$safe]"
+            }
+            return $items
+          }
+
+          if (Get-LauncherPackage) {
             Write-Host "LAUNCHER_ALREADY_INSTALLED=true"
-            Write-Host "LAUNCHER_PACKAGE=$($before.PackageFullName)"
             exit 0
           }
 
@@ -155,95 +137,101 @@ jobs:
           if ($proc.HasExited) {
             Write-Host "INSTALLER_EXITED_EARLY=true"
             Write-Host "INSTALLER_EXIT_CODE=$($proc.ExitCode)"
-          } else {
-            Write-Host "INSTALLER_EXITED_EARLY=false"
+            exit 0
           }
 
-          $items = Dump-InstallerUI $proc.Id "INITIAL"
+          $items = Dump-UI $proc.Id "BEFORE CONSENT"
 
           if ($env:ACCEPT_LAUNCHER_EULA -ne 'true') {
             Write-Host "INSTALL_ATTEMPT_SKIPPED=true"
             Write-Host "REASON=accept_launcher_eula was not explicitly enabled"
-            Stop-MinecraftInstaller
+            Stop-Installer
             exit 0
           }
 
-          Write-Host "INSTALL_ATTEMPT_SKIPPED=false"
           Write-Host "EULA_CONSENT_CONFIRMED_BY_WORKFLOW_INPUT=true"
+          Write-Host "STORE_SIGN_IN_AUTOMATION=false"
 
-          # Only invoke ordinary visible installer controls. Never click sign-in/login controls.
-          $clicked = New-Object 'System.Collections.Generic.HashSet[string]'
-          $safeButtonNames = @(
-            'Accept', 'I agree', 'Agree', 'Install', 'Get', 'Continue', 'Next', "Let's go", 'Lets go'
-          )
+          # Toggle only the explicit EULA checkbox. Never touch the Store login control.
+          $checkbox = $items | Where-Object {
+            $_.AutomationId -eq 'AgreementCheckbox' -and $_.ControlType -eq 'ControlType.CheckBox'
+          } | Select-Object -First 1
 
-          for ($round = 1; $round -le 8; $round++) {
-            $pkg = Get-LauncherPackage
-            if ($pkg) {
-              Write-Host "LAUNCHER_APPEARED_DURING_UI_FLOW=true"
-              break
-            }
-
-            if ($proc.HasExited) {
-              Write-Host "INSTALLER_EXITED_DURING_UI_FLOW=true"
-              break
-            }
-
-            $items = Get-InstallerElements $proc.Id
-            $visibleNames = @($items | Where-Object { $_.Name } | ForEach-Object { $_.Name })
-            if ($visibleNames -match '(?i)sign in|log in|login') {
-              Write-Host "SIGN_IN_UI_DETECTED=true"
-              Write-Host "NO_SIGN_IN_AUTOMATION=true"
-              break
-            }
-
-            $target = $null
-            foreach ($wanted in $safeButtonNames) {
-              $candidate = $items | Where-Object {
-                $_.ControlType -eq 'ControlType.Button' -and
-                $_.Enabled -eq $true -and
-                $_.Name -eq $wanted -and
-                -not $clicked.Contains($_.Name)
-              } | Select-Object -First 1
-              if ($candidate) {
-                $target = $candidate
-                break
-              }
-            }
-
-            if ($target) {
-              try {
-                $patternObj = $null
-                if ($target.Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$patternObj)) {
-                  Write-Host "UI_INVOKE_ROUND=$round NAME=$($target.Name) ID=$($target.AutomationId)"
-                  ([System.Windows.Automation.InvokePattern]$patternObj).Invoke()
-                  [void]$clicked.Add($target.Name)
-                } else {
-                  Write-Host "UI_BUTTON_HAS_NO_INVOKE_PATTERN=$($target.Name)"
-                }
-              } catch {
-                Write-Host "UI_INVOKE_ERROR=$($_.Exception.Message)"
-              }
-            } else {
-              Write-Host "NO_SAFE_BUTTON_FOUND_ROUND=$round"
-            }
-
-            Start-Sleep -Seconds 8
+          if (-not $checkbox) {
+            Write-Host "EULA_CHECKBOX_FOUND=false"
+            Dump-UI $proc.Id "CHECKBOX NOT FOUND" | Out-Null
+            Stop-Installer
+            exit 0
           }
 
-          Dump-InstallerUI $proc.Id "AFTER SAFE UI FLOW" | Out-Null
+          Write-Host "EULA_CHECKBOX_FOUND=true"
+          try {
+            $toggleObj = $null
+            if ($checkbox.Element.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$toggleObj)) {
+              $toggle = [System.Windows.Automation.TogglePattern]$toggleObj
+              Write-Host "EULA_TOGGLE_STATE_BEFORE=$($toggle.Current.ToggleState)"
+              if ($toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::Off) {
+                $toggle.Toggle()
+                Start-Sleep -Seconds 3
+              }
+              Write-Host "EULA_CHECKBOX_TOGGLED=true"
+            } else {
+              Write-Host "EULA_CHECKBOX_HAS_TOGGLE_PATTERN=false"
+            }
+          } catch {
+            Write-Host "EULA_TOGGLE_ERROR=$($_.Exception.Message)"
+          }
 
-          Write-Host "=== WAIT FOR LAUNCHER PACKAGE ==="
-          $deadline = (Get-Date).AddMinutes(3)
+          $items = Dump-UI $proc.Id "AFTER EULA CONSENT"
+
+          # Invoke only the install/continue button by stable AutomationId.
+          $install = $items | Where-Object {
+            $_.AutomationId -eq 'ContinueButton' -and
+            $_.ControlType -eq 'ControlType.Button'
+          } | Select-Object -First 1
+
+          if (-not $install) {
+            Write-Host "INSTALL_BUTTON_FOUND=false"
+          } elseif (-not $install.Enabled) {
+            Write-Host "INSTALL_BUTTON_FOUND=true"
+            Write-Host "INSTALL_BUTTON_ENABLED=false"
+            Write-Host "PREINSTALL_BLOCKER=Installer kept INSTALL disabled after explicit EULA consent."
+          } else {
+            Write-Host "INSTALL_BUTTON_FOUND=true"
+            Write-Host "INSTALL_BUTTON_ENABLED=true"
+            try {
+              $invokeObj = $null
+              if ($install.Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invokeObj)) {
+                ([System.Windows.Automation.InvokePattern]$invokeObj).Invoke()
+                Write-Host "INSTALL_BUTTON_INVOKED=true"
+              } else {
+                Write-Host "INSTALL_BUTTON_INVOKE_PATTERN=false"
+              }
+            } catch {
+              Write-Host "INSTALL_BUTTON_INVOKE_ERROR=$($_.Exception.Message)"
+            }
+          }
+
+          Start-Sleep -Seconds 15
+          if (-not $proc.HasExited) {
+            Dump-UI $proc.Id "15 SECONDS AFTER INSTALL ATTEMPT" | Out-Null
+          }
+
+          Write-Host "=== WAIT FOR LAUNCHER PACKAGE / ERROR STATE ==="
+          $deadline = (Get-Date).AddMinutes(2)
           $lastState = ''
           while ((Get-Date) -lt $deadline) {
             $pkg = Get-LauncherPackage
             if ($pkg) { break }
+            if ($proc.HasExited) {
+              Write-Host "INSTALLER_EXITED_AFTER_ATTEMPT=true"
+              Write-Host "INSTALLER_EXIT_CODE=$($proc.ExitCode)"
+              break
+            }
 
             $interesting = Get-Process -ErrorAction SilentlyContinue |
               Where-Object { $_.ProcessName -match 'Minecraft|Gaming|Xbox|Store|AppInstall|Clip|wsappx' } |
-              Select-Object -ExpandProperty ProcessName -Unique |
-              Sort-Object
+              Select-Object -ExpandProperty ProcessName -Unique | Sort-Object
             $state = ($interesting -join ',')
             if ($state -ne $lastState) {
               Write-Host "RELEVANT_PROCESSES=$state"
@@ -259,10 +247,12 @@ jobs:
             Write-Host "LAUNCHER_INSTALL_LOCATION=$($pkg.InstallLocation)"
           } else {
             Write-Host "LAUNCHER_INSTALLED=false"
-            Write-Host "LIKELY_BLOCKER=See installer UI and process output above; no credentials or Store sign-in were automated."
+            if (-not $proc.HasExited) {
+              Dump-UI $proc.Id "FINAL ERROR / BLOCKER STATE" | Out-Null
+            }
           }
 
-          Stop-MinecraftInstaller
+          Stop-Installer
 
       - name: Inspect installed Launcher package without copying payload
         shell: pwsh
@@ -300,31 +290,15 @@ jobs:
               Write-Host "MANIFEST_PUBLISHER=$($identity.Publisher)"
               Write-Host "MANIFEST_VERSION=$($identity.Version)"
               Write-Host "MANIFEST_ARCH=$($identity.ProcessorArchitecture)"
-
               $manifest.Package.Capabilities.ChildNodes | ForEach-Object {
                 if ($_.Name) { Write-Host "CAPABILITY=$($_.Name)" }
               }
-
               $manifest.Package.Applications.Application | ForEach-Object {
                 Write-Host "APP_ID=$($_.Id) EXECUTABLE=$($_.Executable) ENTRYPOINT=$($_.EntryPoint)"
-                $_.Extensions.ChildNodes | ForEach-Object {
-                  if ($_.Category) { Write-Host "EXTENSION_CATEGORY=$($_.Category)" }
-                }
               }
             } catch {
               Write-Host "MANIFEST_PARSE_ERROR=$($_.Exception.Message)"
             }
-          } else {
-            Write-Host "MANIFEST_FOUND=false"
-          }
-
-          Write-Host "=== EXECUTABLE / LIBRARY INVENTORY ==="
-          $bins = Get-ChildItem $pkg.InstallLocation -Recurse -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -in '.exe','.dll','.winmd','.json','.js' }
-          Write-Host "BINARY_OR_CODE_FILE_COUNT=$($bins.Count)"
-          $bins | Select-Object -First 220 | ForEach-Object {
-            $rel = $_.FullName.Substring($pkg.InstallLocation.Length).TrimStart('\\')
-            Write-Host "FILE=$rel SIZE=$($_.Length)"
           }
 
           Write-Host "=== ACQUISITION STRING TARGETS ==="
@@ -345,7 +319,6 @@ jobs:
 
           $rg = Get-Command rg -ErrorAction SilentlyContinue
           if ($rg) {
-            Write-Host "SCANNER=ripgrep"
             foreach ($needle in $needles) {
               Write-Host "--- NEEDLE=$needle ---"
               $matches = & $rg.Source -a -l -F --glob '!*.png' --glob '!*.jpg' --glob '!*.jpeg' --glob '!*.webp' --glob '!*.mp4' --glob '!*.ogg' --glob '!*.wav' -- "$needle" $pkg.InstallLocation 2>$null
@@ -358,10 +331,6 @@ jobs:
                 Write-Host "MATCH_FILE=$rel"
               }
             }
-          } else {
-            Write-Host "SCANNER=ripgrep-unavailable"
-            Write-Host "STRING_SCAN_SKIPPED=true"
           }
 
-          Write-Host "=== FINAL ==="
           Write-Host "FINAL_RESULT=Official Minecraft Launcher package materialized and was inspected in place; no package payload was uploaded."
