@@ -1,0 +1,238 @@
+name: Test Minecraft Launcher Store Web Installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-store-web-installer:
+    runs-on: windows-11-arm
+
+    steps:
+      - name: System and Edge info
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "=== SYSTEM ==="
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture
+
+          $candidates = @(
+            "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+            "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
+          )
+
+          $edge = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $edge) {
+            throw "Microsoft Edge was not found on the runner."
+          }
+
+          Write-Host "EDGE_PATH=$edge"
+          & $edge --version
+
+          "EDGE_PATH=$edge" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          $downloadDir = Join-Path $env:RUNNER_TEMP "store-web-installer-downloads"
+          New-Item -ItemType Directory -Force -Path $downloadDir | Out-Null
+          "DOWNLOAD_DIR=$downloadDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build browser inspector
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tool = Join-Path $env:RUNNER_TEMP "store-web-installer-browser"
+          New-Item -ItemType Directory -Force -Path $tool | Out-Null
+          Push-Location $tool
+
+          npm init -y | Out-Null
+          npm install playwright-core | Out-Null
+
+          @'
+          const fs = require('fs');
+          const path = require('path');
+          const { chromium } = require('playwright-core');
+
+          const edgePath = process.env.EDGE_PATH;
+          const downloadDir = process.env.DOWNLOAD_DIR;
+
+          const urls = [
+            'https://apps.microsoft.com/detail/9PGW18NPBZV5?hl=en-US&gl=SE',
+            'https://apps.microsoft.com/detail/9PGW18NPBZV5?hl=en-US&gl=US'
+          ];
+
+          const browser = await chromium.launch({
+            executablePath: edgePath,
+            headless: true,
+            downloadsPath: downloadDir
+          });
+
+          let downloaded = false;
+
+          for (const url of urls) {
+            console.log('=================================');
+            console.log(`PAGE_REQUESTED=${url}`);
+            console.log('=================================');
+
+            const context = await browser.newContext({
+              acceptDownloads: true,
+              locale: 'en-US'
+            });
+            const page = await context.newPage();
+
+            page.on('console', msg => {
+              const text = msg.text();
+              if (/error|download|install|store|minecraft/i.test(text))
+                console.log(`PAGE_CONSOLE=${msg.type()}:${text}`);
+            });
+
+            try {
+              const response = await page.goto(url, {
+                waitUntil: 'domcontentloaded',
+                timeout: 60000
+              });
+
+              console.log(`HTTP_STATUS=${response ? response.status() : 'NO_RESPONSE'}`);
+              await page.waitForTimeout(8000);
+              console.log(`FINAL_URL=${page.url()}`);
+              console.log(`TITLE=${await page.title()}`);
+
+              const bodyText = await page.locator('body').innerText().catch(() => '');
+              console.log(`HAS_PRODUCT_ID=${bodyText.includes('9PGW18NPBZV5')}`);
+              console.log(`HAS_MINECRAFT=${/Minecraft/i.test(bodyText)}`);
+              console.log(`HAS_LAUNCHER=${/Launcher/i.test(bodyText)}`);
+
+              console.log('=== RELEVANT VISIBLE TEXT ===');
+              const relevantLines = bodyText
+                .split(/\r?\n/)
+                .map(x => x.trim())
+                .filter(Boolean)
+                .filter(x => /minecraft|launcher|download|install|microsoft store|view in|open in|get|ladda|hämta|skaffa/i.test(x))
+                .slice(0, 120);
+              for (const line of relevantLines)
+                console.log(`TEXT=${line}`);
+
+              console.log('=== BUTTONS AND LINKS ===');
+              const controls = await page.locator('a,button').evaluateAll(nodes => nodes.map((n, index) => ({
+                index,
+                tag: n.tagName,
+                text: (n.innerText || n.textContent || '').trim().replace(/\s+/g, ' '),
+                aria: n.getAttribute('aria-label') || '',
+                href: n.getAttribute('href') || '',
+                disabled: !!n.disabled
+              })));
+
+              const interesting = controls.filter(c =>
+                /download|install|store|minecraft|launcher|view|get|ladda|hämta|skaffa/i.test(`${c.text} ${c.aria} ${c.href}`)
+              );
+
+              for (const c of interesting.slice(0, 120))
+                console.log(`CONTROL=${JSON.stringify(c)}`);
+
+              // Use only the normal web UI. Never call undocumented Store endpoints.
+              // Click only a visible control explicitly presented as a web download.
+              const downloadCandidates = page.locator('a,button').filter({
+                hasText: /download|ladda ned|hämta/i
+              });
+
+              const count = await downloadCandidates.count();
+              console.log(`DOWNLOAD_CONTROL_COUNT=${count}`);
+
+              for (let i = 0; i < Math.min(count, 5); i++) {
+                const candidate = downloadCandidates.nth(i);
+                if (!(await candidate.isVisible().catch(() => false)))
+                  continue;
+
+                const text = ((await candidate.innerText().catch(() => '')) || '').trim();
+                const href = (await candidate.getAttribute('href').catch(() => '')) || '';
+                console.log(`DOWNLOAD_CANDIDATE_TEXT=${text}`);
+                console.log(`DOWNLOAD_CANDIDATE_HREF=${href}`);
+
+                if (href.toLowerCase().startsWith('ms-windows-store:')) {
+                  console.log('SKIP_REASON=Candidate opens Microsoft Store app rather than web installer download');
+                  continue;
+                }
+
+                try {
+                  const downloadPromise = page.waitForEvent('download', { timeout: 15000 });
+                  await candidate.click({ timeout: 10000 });
+                  const download = await downloadPromise;
+                  const suggested = download.suggestedFilename();
+                  const target = path.join(downloadDir, suggested);
+                  await download.saveAs(target);
+                  console.log(`WEB_INSTALLER_DOWNLOADED=${target}`);
+                  downloaded = true;
+                  break;
+                } catch (e) {
+                  console.log(`DOWNLOAD_CLICK_RESULT=NO_DOWNLOAD_EVENT:${e.name}`);
+                }
+              }
+            } catch (e) {
+              console.log(`PAGE_ERROR=${e.stack || e}`);
+            }
+
+            await context.close();
+            if (downloaded)
+              break;
+          }
+
+          console.log(`STORE_WEB_INSTALLER_FILE_PRESENT=${downloaded}`);
+          await browser.close();
+          '@ | Set-Content -Path (Join-Path $tool "inspect.mjs") -Encoding UTF8
+
+          "BROWSER_TOOL=$tool" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Pop-Location
+
+      - name: Inspect official Microsoft Store product page
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Push-Location $env:BROWSER_TOOL
+          node .\inspect.mjs
+          Pop-Location
+
+      - name: Verify any Store Web Installer stub
+        shell: pwsh
+        run: |
+          Write-Host "=== DOWNLOADED FILE INSPECTION ==="
+
+          $files = @(Get-ChildItem $env:DOWNLOAD_DIR -Recurse -File -ErrorAction SilentlyContinue)
+          Write-Host "DOWNLOADED_FILE_COUNT=$($files.Count)"
+
+          if ($files.Count -eq 0) {
+            Write-Host "NO_STORE_WEB_INSTALLER_STUB_DOWNLOADED"
+            exit 0
+          }
+
+          foreach ($file in $files) {
+            $hash = Get-FileHash $file.FullName -Algorithm SHA256
+            $sig = Get-AuthenticodeSignature $file.FullName
+            $vi = $file.VersionInfo
+
+            Write-Host "--- FILE ---"
+            Write-Host "NAME=$($file.Name)"
+            Write-Host "SIZE=$($file.Length)"
+            Write-Host "SHA256=$($hash.Hash)"
+            Write-Host "SIGNATURE_STATUS=$($sig.Status)"
+            if ($sig.SignerCertificate) {
+              Write-Host "SIGNER=$($sig.SignerCertificate.Subject)"
+              Write-Host "SIGNER_ISSUER=$($sig.SignerCertificate.Issuer)"
+            }
+            Write-Host "PRODUCT=$($vi.ProductName)"
+            Write-Host "FILE_VERSION=$($vi.FileVersion)"
+          }
+
+          Write-Host "The downloaded stub was NOT executed."
+
+      - name: Final marker
+        shell: pwsh
+        run: |
+          Write-Host "=== STORE WEB INSTALLER RESEARCH COMPLETE ==="
+          Write-Host "Only the public apps.microsoft.com product page was used."
+          Write-Host "No undocumented Microsoft Store API was called by this workflow."
+          Write-Host "No Microsoft account was used."
+          Write-Host "No EULA was accepted automatically."
+          Write-Host "No installer or Store Web Installer stub was executed."
+          Write-Host "No Minecraft game package was downloaded."
