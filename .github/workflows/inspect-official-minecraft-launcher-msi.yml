@@ -1,0 +1,240 @@
+name: Inspect official Minecraft Launcher MSI path
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-msi:
+    runs-on: windows-11-arm
+
+    steps:
+      - name: System info
+        shell: pwsh
+        run: |
+          Write-Host "=== SYSTEM ==="
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture
+
+      - name: Download official Mojang MSI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = Join-Path $env:RUNNER_TEMP "minecraft-launcher-msi"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $msi = Join-Path $root "MinecraftInstaller.msi"
+
+          Write-Host "=== OFFICIAL MOJANG MSI ==="
+          Write-Host "SOURCE=https://launcher.mojang.com/download/MinecraftInstaller.msi"
+
+          Invoke-WebRequest `
+            -Uri "https://launcher.mojang.com/download/MinecraftInstaller.msi" `
+            -OutFile $msi `
+            -MaximumRedirection 10
+
+          $file = Get-Item $msi
+          $hash = Get-FileHash $msi -Algorithm SHA256
+          $sig = Get-AuthenticodeSignature $msi
+
+          Write-Host "SIZE=$($file.Length)"
+          Write-Host "SHA256=$($hash.Hash)"
+          Write-Host "WINGET_2024_EXPECTED_SHA256=E7040ADDF5FBB1DAC0D7E61D0793B1550526ACCAF80A315E36B636285BD9D90E"
+          Write-Host "MATCHES_2024_WINGET_MANIFEST=$($hash.Hash -eq 'E7040ADDF5FBB1DAC0D7E61D0793B1550526ACCAF80A315E36B636285BD9D90E')"
+          Write-Host "SIGNATURE_STATUS=$($sig.Status)"
+          if ($sig.SignerCertificate) {
+            Write-Host "SIGNER=$($sig.SignerCertificate.Subject)"
+            Write-Host "SIGNER_ISSUER=$($sig.SignerCertificate.Issuer)"
+          }
+
+          "MSI_PATH=$msi" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "MSI_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Read MSI metadata and tables
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "=== WINDOWS INSTALLER METADATA ==="
+
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $database = $installer.OpenDatabase($env:MSI_PATH, 0)
+
+          function Read-MsiQuery([string]$label, [string]$query) {
+            Write-Host ""
+            Write-Host "=== $label ==="
+            try {
+              $view = $database.OpenView($query)
+              $view.Execute()
+              while ($record = $view.Fetch()) {
+                $parts = @()
+                for ($i = 1; $i -le $record.FieldCount; $i++) {
+                  $parts += $record.StringData($i)
+                }
+                Write-Host ($parts -join ' | ')
+              }
+              $view.Close()
+            }
+            catch {
+              Write-Host "QUERY_FAILED=$($_.Exception.Message)"
+            }
+          }
+
+          Read-MsiQuery "PROPERTIES" "SELECT `Property`,`Value` FROM `Property`"
+          Read-MsiQuery "FILES" "SELECT `File`,`Component_`,`FileName`,`FileSize`,`Version`,`Language`,`Attributes` FROM `File`"
+          Read-MsiQuery "COMPONENTS" "SELECT `Component`,`ComponentId`,`Directory_`,`Attributes`,`Condition`,`KeyPath` FROM `Component`"
+          Read-MsiQuery "CUSTOM ACTIONS" "SELECT `Action`,`Type`,`Source`,`Target` FROM `CustomAction`"
+          Read-MsiQuery "REGISTRY" "SELECT `Registry`,`Root`,`Key`,`Name`,`Value`,`Component_` FROM `Registry`"
+          Read-MsiQuery "SHORTCUTS" "SELECT `Shortcut`,`Directory_`,`Name`,`Component_`,`Target`,`Arguments` FROM `Shortcut`"
+
+          exit 0
+
+      - name: Administrative extract MSI without normal install
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          $extract = Join-Path $env:MSI_ROOT "admin-image"
+          $log = Join-Path $env:MSI_ROOT "msiexec-admin.log"
+          New-Item -ItemType Directory -Force -Path $extract | Out-Null
+
+          Write-Host "=== MSI ADMINISTRATIVE EXTRACTION ==="
+          Write-Host "This uses msiexec /a to create an administrative image; it is not a normal launcher install."
+
+          $args = @(
+            '/a',
+            $env:MSI_PATH,
+            "TARGETDIR=$extract",
+            '/qn',
+            '/norestart',
+            '/l*v',
+            $log
+          )
+
+          $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru
+          Write-Host "MSI_ADMIN_EXIT=$($proc.ExitCode)"
+
+          Write-Host ""
+          Write-Host "=== EXTRACTED FILES ==="
+          $files = @(Get-ChildItem $extract -Recurse -File -ErrorAction SilentlyContinue)
+          Write-Host "EXTRACTED_FILE_COUNT=$($files.Count)"
+
+          foreach ($file in $files) {
+            Write-Host "--- FILE ---"
+            Write-Host "PATH=$($file.FullName.Substring($extract.Length).TrimStart('\'))"
+            Write-Host "SIZE=$($file.Length)"
+
+            if ($file.Extension -in '.exe','.dll','.msi') {
+              $hash = Get-FileHash $file.FullName -Algorithm SHA256
+              $sig = Get-AuthenticodeSignature $file.FullName
+              $vi = $file.VersionInfo
+              Write-Host "SHA256=$($hash.Hash)"
+              Write-Host "SIGNATURE_STATUS=$($sig.Status)"
+              if ($sig.SignerCertificate) {
+                Write-Host "SIGNER=$($sig.SignerCertificate.Subject)"
+              }
+              Write-Host "PRODUCT=$($vi.ProductName)"
+              Write-Host "FILE_VERSION=$($vi.FileVersion)"
+            }
+          }
+
+          Write-Host ""
+          Write-Host "=== MSI LOG TAIL ==="
+          if (Test-Path $log) {
+            Get-Content $log -Tail 120
+          }
+
+          "EXTRACT_PATH=$extract" | Out-File -FilePath $env:GITHUB_ENV -Append
+          exit 0
+
+      - name: Inspect extracted launcher binaries for acquisition clues
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          if (-not (Test-Path $env:EXTRACT_PATH)) {
+            Write-Host "NO_EXTRACT_PATH"
+            exit 0
+          }
+
+          Write-Host "=== STATIC ACQUISITION CLUES IN EXTRACTED MSI PAYLOAD ==="
+
+          $patterns = @(
+            '9PGW18NPBZV5',
+            '9NBLGGH2JHXJ',
+            'Microsoft.4297127D64EC6',
+            'Microsoft.MinecraftUWP',
+            'Microsoft.GamingServices',
+            'GamingServices',
+            'xgameruntime',
+            'XStore',
+            'ms-windows-store',
+            'StoreContext',
+            'Xbox',
+            'api.minecraftservices.com',
+            'minecraftservices.com',
+            'launcher.mojang.com',
+            'storeedgefd.dsx.mp.microsoft.com',
+            'WindowsApps'
+          )
+
+          $bins = @(Get-ChildItem $env:EXTRACT_PATH -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in '.exe','.dll','.json','.xml','.config' })
+
+          foreach ($bin in $bins) {
+            try {
+              $bytes = [System.IO.File]::ReadAllBytes($bin.FullName)
+              $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+              $unicode = [System.Text.Encoding]::Unicode.GetString($bytes)
+              $matched = @()
+
+              foreach ($pattern in $patterns) {
+                if ($ascii -match [regex]::Escape($pattern) -or $unicode -match [regex]::Escape($pattern)) {
+                  $matched += $pattern
+                }
+              }
+
+              if ($matched.Count -gt 0) {
+                Write-Host "--- CLUE FILE ---"
+                Write-Host "FILE=$($bin.FullName)"
+                foreach ($m in $matched | Select-Object -Unique) {
+                  Write-Host "MATCH=$m"
+                }
+              }
+            }
+            catch {
+              Write-Host "SCAN_SKIPPED=$($bin.FullName)"
+            }
+          }
+
+          exit 0
+
+      - name: List modern official installer as archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          $modern = Join-Path $env:MSI_ROOT "MinecraftInstaller-modern.exe"
+          Invoke-WebRequest `
+            -Uri "https://aka.ms/minecraftClientGameCoreWindows" `
+            -OutFile $modern `
+            -MaximumRedirection 10
+
+          Write-Host "=== 7-ZIP LIST OF MODERN OFFICIAL INSTALLER ==="
+          $sevenZip = Get-Command 7z.exe -ErrorAction SilentlyContinue
+          if (-not $sevenZip) {
+            Write-Host "7ZIP_NOT_AVAILABLE"
+            exit 0
+          }
+
+          & $sevenZip.Source l -slt $modern
+          exit 0
+
+      - name: Final interpretation marker
+        shell: pwsh
+        run: |
+          Write-Host "=== DEEPER LAUNCHER MSI RESEARCH COMPLETE ==="
+          Write-Host "No Microsoft account was used."
+          Write-Host "No ownership decision was spoofed."
+          Write-Host "No Minecraft game package was downloaded from a community source."
+          Write-Host "The MSI was only downloaded from Mojang and administratively extracted for inspection."
