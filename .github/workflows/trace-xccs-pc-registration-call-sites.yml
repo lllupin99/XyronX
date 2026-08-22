@@ -1,0 +1,200 @@
+name: Trace XCCS PC registration call sites
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  trace-xccs-registration:
+    runs-on: windows-11-arm
+    timeout-minutes: 15
+
+    steps:
+      - name: Prepare static inspection environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $candidates = @(
+            "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+            "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
+          )
+          $edge = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $edge) { throw "Microsoft Edge not found." }
+
+          $root = Join-Path $env:RUNNER_TEMP "xccs-registration-call-sites"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          "EDGE_PATH=$edge" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "STATIC_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "EDGE_PATH=$edge"
+          Write-Host "STATIC_ROOT=$root"
+
+      - name: Collect public Xbox JavaScript bundle URLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Push-Location $env:STATIC_ROOT
+          npm init -y | Out-Null
+          npm install playwright-core | Out-Null
+
+          @'
+          import fs from 'node:fs';
+          import { chromium } from 'playwright-core';
+
+          const browser = await chromium.launch({
+            executablePath: process.env.EDGE_PATH,
+            headless: true
+          });
+          const context = await browser.newContext({ locale: 'en-US' });
+          const page = await context.newPage();
+          const seen = new Set();
+
+          page.on('request', request => {
+            const url = request.url();
+            if (/^https:\/\/assets-xbxweb\.xbox\.com\/xbox-web\/static\/js\/.*\.js(?:\?.*)?$/i.test(url)) seen.add(url);
+          });
+
+          const requested = 'https://apps.microsoft.com/detail/9PGW18NPBZV5?hl=en-US&gl=US';
+          console.log(`PAGE_REQUESTED=${requested}`);
+          const response = await page.goto(requested, { waitUntil: 'domcontentloaded', timeout: 60000 });
+          console.log(`HTTP_STATUS=${response ? response.status() : 'NO_RESPONSE'}`);
+          await page.waitForTimeout(10000);
+          console.log(`FINAL_URL=${page.url()}`);
+
+          for (const url of await page.locator('script[src]').evaluateAll(nodes => nodes.map(n => n.src).filter(Boolean))) {
+            if (/^https:\/\/assets-xbxweb\.xbox\.com\/xbox-web\/static\/js\/.*\.js(?:\?.*)?$/i.test(url)) seen.add(url);
+          }
+
+          const urls = [...seen].sort();
+          console.log(`BUNDLE_COUNT=${urls.length}`);
+          fs.writeFileSync('bundle-urls.json', JSON.stringify(urls, null, 2));
+          await context.close();
+          await browser.close();
+          '@ | Set-Content -Path (Join-Path $env:STATIC_ROOT "collect.mjs") -Encoding UTF8
+
+          node .\collect.mjs
+          Pop-Location
+
+      - name: Download and pretty-print registration-related bundles
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $urls = Get-Content (Join-Path $env:STATIC_ROOT "bundle-urls.json") -Raw | ConvertFrom-Json
+          $bundleDir = Join-Path $env:STATIC_ROOT "bundles"
+          $prettyDir = Join-Path $env:STATIC_ROOT "pretty"
+          New-Item -ItemType Directory -Force -Path $bundleDir,$prettyDir | Out-Null
+
+          foreach ($url in $urls) {
+            $uri = [Uri]$url
+            $name = [System.IO.Path]::GetFileName($uri.AbsolutePath)
+            $target = Join-Path $bundleDir $name
+            Invoke-WebRequest -Uri $url -OutFile $target -MaximumRedirection 5
+          }
+
+          Push-Location $env:STATIC_ROOT
+          npm install prettier | Out-Null
+          $hits = @()
+          Get-ChildItem $bundleDir -File -Filter '*.js' | ForEach-Object {
+            $text = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
+            if ($text -and $text -match 'registerDevice|registerForPushNotification|x-xbl-deviceId|MissingWnsChannelUri|RegisterDevice|RegisterForPushNotification') {
+              $hits += $_
+            }
+          }
+
+          Write-Host "REGISTRATION_RELATED_FILE_COUNT=$($hits.Count)"
+          foreach ($file in $hits) {
+            Write-Host "REGISTRATION_RELATED_FILE=$($file.Name)"
+            $out = Join-Path $prettyDir $file.Name
+            npx prettier $file.FullName --parser babel | Set-Content -Path $out -Encoding UTF8
+          }
+          Pop-Location
+
+          "PRETTY_DIR=$prettyDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Trace registerDevice and push-registration call sites
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "=== XCCS PC REGISTRATION CALL-SITE TRACE ==="
+          Write-Host "Static inspection only; no XCCS request is sent."
+
+          $files = @(Get-ChildItem $env:PRETTY_DIR -File -Filter '*.js' -ErrorAction SilentlyContinue)
+          Write-Host "PRETTY_FILE_COUNT=$($files.Count)"
+
+          $needles = @(
+            '.registerDevice(',
+            'registerDevice(',
+            '.registerForPushNotification(',
+            'registerForPushNotification(',
+            'RegisterDevice',
+            'RegisterForPushNotification',
+            'x-xbl-deviceId',
+            'MissingWnsChannelUri',
+            'ErrorGettingWNSS2SToken',
+            'ErrorCallingWNS',
+            'UnsupportedDeviceTypeClaim',
+            'RegisteredClientNotFound',
+            'remoteManagementEnabled',
+            'friendlyName',
+            'endpointType',
+            'PushNotification',
+            'WnsChannel',
+            'channelUri',
+            'deviceId'
+          )
+
+          foreach ($needle in $needles) {
+            Write-Host ""
+            Write-Host "===== NEEDLE: $needle ====="
+            $shown = 0
+            foreach ($file in $files) {
+              $matches = @(Select-String -Path $file.FullName -Pattern $needle -SimpleMatch -Context 35,55 -ErrorAction SilentlyContinue)
+              foreach ($match in $matches) {
+                if ($shown -ge 8) { break }
+                Write-Host "--- FILE=$($file.Name) LINE=$($match.LineNumber) ---"
+                foreach ($line in $match.Context.PreContext) { Write-Host $line }
+                Write-Host ">>> $($match.Line)"
+                foreach ($line in $match.Context.PostContext) { Write-Host $line }
+                $shown++
+              }
+              if ($shown -ge 8) { break }
+            }
+          }
+          exit 0
+
+      - name: Extract XCCS method bodies and registration literals
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "=== XCCS REGISTRATION METHOD/LITERAL SUMMARY ==="
+          $files = @(Get-ChildItem $env:PRETTY_DIR -File -Filter '*.js' -ErrorAction SilentlyContinue)
+
+          foreach ($file in $files) {
+            $text = Get-Content $file.FullName -Raw -ErrorAction SilentlyContinue
+            if (-not $text) { continue }
+            if ($text -notmatch 'registerDevice|registerForPushNotification') { continue }
+            Write-Host "--- FILE=$($file.Name) ---"
+
+            [regex]::Matches($text, 'https?://[^"''`\s)]+') |
+              ForEach-Object { $_.Value } |
+              Sort-Object -Unique |
+              Where-Object { $_ -match 'xbox|wns|notify|push|device|xccs' } |
+              ForEach-Object { Write-Host "URL=$_" }
+
+            [regex]::Matches($text, '["''][A-Za-z0-9_./{}?=&:-]{3,220}["'']') |
+              ForEach-Object { $_.Value.Trim('"','''') } |
+              Sort-Object -Unique |
+              Where-Object { $_ -match 'register|device|wns|push|notification|remote|endpoint|install|config|claim|client' } |
+              Select-Object -First 300 |
+              ForEach-Object { Write-Host "LITERAL=$_" }
+          }
+          exit 0
+
+      - name: Safety marker
+        shell: pwsh
+        run: |
+          Write-Host "=== XCCS PC REGISTRATION TRACE COMPLETE ==="
+          Write-Host "Only JavaScript publicly served by xbox.com was downloaded and statically inspected."
+          Write-Host "No Microsoft account was used."
+          Write-Host "No auth token, cookie, fabricated device ID, WNS channel, device registration, install, Store, or XCCS API request was performed."
