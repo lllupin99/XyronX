@@ -88,12 +88,17 @@ jobs:
             Write-Host "UI_WAIT_ATTEMPT=$attempt ELEMENTS=$($elements.Count) CHECKBOX_FOUND=$([bool]$checkbox)"
             if ($checkbox) { break }
           }
-          if (-not $checkbox) { Write-Host 'EULA_CHECKBOX_FOUND=false'; exit 0 }
+          if (-not $checkbox) {
+            Write-Host 'EULA_CHECKBOX_FOUND=false'
+            exit 0
+          }
 
           $pattern = $null
           if ($checkbox.Element.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
             $toggle = [System.Windows.Automation.TogglePattern]$pattern
-            if ($toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::Off) { $toggle.Toggle() }
+            if ($toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::Off) {
+              $toggle.Toggle()
+            }
           }
           Start-Sleep -Seconds 3
 
@@ -101,7 +106,10 @@ jobs:
           $button = $elements |
             Where-Object { $_.Id -eq 'ContinueButton' -and $_.Type -eq 'ControlType.Button' -and $_.Enabled } |
             Select-Object -First 1
-          if (-not $button) { Write-Host 'INSTALL_BUTTON_READY=false'; exit 0 }
+          if (-not $button) {
+            Write-Host 'INSTALL_BUTTON_READY=false'
+            exit 0
+          }
 
           $pattern = $null
           if ($button.Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
@@ -117,7 +125,10 @@ jobs:
             if ($gs) { break }
             if ($proc.HasExited) { break }
           }
-          if (-not $gs) { Write-Host 'GAMING_SERVICES_PRESENT=false'; exit 0 }
+          if (-not $gs) {
+            Write-Host 'GAMING_SERVICES_PRESENT=false'
+            exit 0
+          }
 
           Write-Host "GAMING_SERVICES_PRESENT=true PACKAGE=$($gs.PackageFullName)"
           "GAMING_SERVICES_ROOT=$($gs.InstallLocation)" | Out-File $env:GITHUB_ENV -Append
@@ -138,52 +149,34 @@ jobs:
           Write-Host 'NO_LICENSE_METHODS_INVOKED=true'
           Write-Host 'NO_PACKAGE_REQUESTS_SUBMITTED=true'
 
-          $source = @"
-using System;
-using System.Runtime.InteropServices;
-
-public static class WinRtActivationProbe
-{
-    [DllImport("combase.dll")]
-    private static extern int RoInitialize(uint initType);
-
-    [DllImport("combase.dll")]
-    private static extern void RoUninitialize();
-
-    [DllImport("combase.dll", CharSet = CharSet.Unicode)]
-    private static extern int WindowsCreateString(string sourceString, int length, out IntPtr hstring);
-
-    [DllImport("combase.dll")]
-    private static extern int WindowsDeleteString(IntPtr hstring);
-
-    [DllImport("combase.dll")]
-    private static extern int RoGetActivationFactory(IntPtr activatableClassId, ref Guid iid, out IntPtr factory);
-
-    private static readonly Guid IID_IActivationFactory = new Guid("00000035-0000-0000-C000-000000000046");
-
-    public static int Probe(string className)
-    {
-        int init = RoInitialize(1);
-        IntPtr h = IntPtr.Zero;
-        IntPtr factory = IntPtr.Zero;
-        try
-        {
-            int hr = WindowsCreateString(className, className.Length, out h);
-            if (hr < 0) return hr;
-            Guid iid = IID_IActivationFactory;
-            hr = RoGetActivationFactory(h, ref iid, out factory);
-            return hr;
-        }
-        finally
-        {
-            if (factory != IntPtr.Zero) Marshal.Release(factory);
-            if (h != IntPtr.Zero) WindowsDeleteString(h);
-            if (init >= 0) RoUninitialize();
-        }
-    }
-}
-"@
-
+          $sourceLines = @(
+            'using System;',
+            'using System.Runtime.InteropServices;',
+            'public static class WinRtActivationProbe {',
+            '  [DllImport("combase.dll")] private static extern int RoInitialize(uint initType);',
+            '  [DllImport("combase.dll")] private static extern void RoUninitialize();',
+            '  [DllImport("combase.dll", CharSet = CharSet.Unicode)] private static extern int WindowsCreateString(string sourceString, int length, out IntPtr hstring);',
+            '  [DllImport("combase.dll")] private static extern int WindowsDeleteString(IntPtr hstring);',
+            '  [DllImport("combase.dll")] private static extern int RoGetActivationFactory(IntPtr activatableClassId, ref Guid iid, out IntPtr factory);',
+            '  private static readonly Guid IID_IActivationFactory = new Guid("00000035-0000-0000-C000-000000000046");',
+            '  public static int Probe(string className) {',
+            '    int init = RoInitialize(1);',
+            '    IntPtr h = IntPtr.Zero;',
+            '    IntPtr factory = IntPtr.Zero;',
+            '    try {',
+            '      int hr = WindowsCreateString(className, className.Length, out h);',
+            '      if (hr < 0) return hr;',
+            '      Guid iid = IID_IActivationFactory;',
+            '      return RoGetActivationFactory(h, ref iid, out factory);',
+            '    } finally {',
+            '      if (factory != IntPtr.Zero) Marshal.Release(factory);',
+            '      if (h != IntPtr.Zero) WindowsDeleteString(h);',
+            '      if (init >= 0) RoUninitialize();',
+            '    }',
+            '  }',
+            '}'
+          )
+          $source = $sourceLines -join [Environment]::NewLine
           Add-Type -TypeDefinition $source -Language CSharp
 
           $classes = @(
@@ -197,36 +190,8 @@ public static class WinRtActivationProbe
 
           foreach ($class in $classes) {
             $hr = [WinRtActivationProbe]::Probe($class)
-            $u = [uint32]$hr
-            Write-Host ("ACTIVATION_CLASS={0} HRESULT=0x{1:X8} SUCCESS={2}" -f $class, $u, ($hr -ge 0))
+            $hex = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$hr), 0)
+            Write-Host ("ACTIVATION_CLASS={0} HRESULT=0x{1:X8} SUCCESS={2}" -f $class, $hex, ($hr -ge 0))
           }
-
-      - name: Dump focused WinMD signatures if ildasm is available
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-          if (-not $env:GAMING_SERVICES_ROOT) { exit 0 }
-          $winmd = Join-Path $env:GAMING_SERVICES_ROOT 'microsoft.gameplatform.services.winmd'
-          if (-not (Test-Path $winmd)) { Write-Host 'WINMD_PRESENT=false'; exit 0 }
-
-          $ildasm = Get-ChildItem "${env:ProgramFiles(x86)}\Microsoft SDKs", "${env:ProgramFiles}\Microsoft Visual Studio" -Filter ildasm.exe -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $ildasm) {
-            Write-Host 'ILDASM_AVAILABLE=false'
-            exit 0
-          }
-
-          Write-Host "ILDASM=$($ildasm.FullName)"
-          $out = Join-Path $env:RUNNER_TEMP 'gameplatform-winmd.il'
-          & $ildasm.FullName $winmd /text /nobar "/out=$out" 2>$null
-          if (-not (Test-Path $out)) { Write-Host 'ILDASM_OUTPUT=false'; exit 0 }
-
-          Select-String -Path $out -Pattern 'CreateForStoreId|SubmitRequestAsync|QueryProductDetails|QueryProductType|GetProductsAccessAsync|RefreshLicenses' -Context 3,8 |
-            Select-Object -First 120 |
-            ForEach-Object {
-              $line = $_.Line.Trim()
-              if ($line) { Write-Host "ILSIG=$line" }
-              foreach ($ctx in $_.Context.PreContext) { if ($ctx.Trim()) { Write-Host "ILSIG_CONTEXT=$($ctx.Trim())" } }
-              foreach ($ctx in $_.Context.PostContext) { if ($ctx.Trim()) { Write-Host "ILSIG_CONTEXT=$($ctx.Trim())" } }
-            }
 
           Write-Host 'FINAL_RESULT=Activation-boundary probe completed. No Store acquisition, licensing refresh, entitlement mutation, or package submission was performed.'
