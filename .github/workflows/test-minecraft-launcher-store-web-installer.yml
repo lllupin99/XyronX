@@ -51,9 +51,8 @@ jobs:
           npm install playwright-core | Out-Null
 
           @'
-          const fs = require('fs');
-          const path = require('path');
-          const { chromium } = require('playwright-core');
+          import path from 'node:path';
+          import { chromium } from 'playwright-core';
 
           const edgePath = process.env.EDGE_PATH;
           const downloadDir = process.env.DOWNLOAD_DIR;
@@ -131,8 +130,6 @@ jobs:
               for (const c of interesting.slice(0, 120))
                 console.log(`CONTROL=${JSON.stringify(c)}`);
 
-              // Use only the normal web UI. Never call undocumented Store endpoints.
-              // Click only a visible control explicitly presented as a web download.
               const downloadCandidates = page.locator('a,button').filter({
                 hasText: /download|ladda ned|hämta/i
               });
