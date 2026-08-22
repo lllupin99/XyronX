@@ -56,6 +56,7 @@ jobs:
           Add-Type -AssemblyName System.Reflection.Metadata
 
           $stream = [System.IO.File]::OpenRead($env:INSTALLER_PATH)
+          $pe = $null
           try {
             $pe = [System.Reflection.PortableExecutable.PEReader]::new($stream)
             Write-Host "=== PE / CLR ==="
@@ -65,6 +66,13 @@ jobs:
             if (-not $pe.HasMetadata) {
               throw "Installer does not expose CLR metadata."
             }
+
+            # GetMetadataReader is a .NET extension method. PowerShell does not
+            # bind C# extension methods through instance syntax ($pe.GetMetadataReader()).
+            # Call the documented static extension class explicitly instead.
+            $reader = [System.Reflection.Metadata.PEReaderExtensions]::GetMetadataReader($pe)
+            Write-Host "METADATA_READER_TYPE=$($reader.GetType().FullName)"
+            Write-Host "METADATA_READER_PREFLIGHT=PASS"
           }
           finally {
             if ($pe) { $pe.Dispose() }
@@ -97,9 +105,10 @@ jobs:
           )
 
           $stream = [System.IO.File]::OpenRead($env:INSTALLER_PATH)
+          $pe = $null
           try {
             $pe = [System.Reflection.PortableExecutable.PEReader]::new($stream)
-            $reader = $pe.GetMetadataReader()
+            $reader = [System.Reflection.Metadata.PEReaderExtensions]::GetMetadataReader($pe)
 
             Write-Host "=== RELEVANT MANAGED TYPE / METHOD NAMES ==="
 
@@ -149,9 +158,10 @@ jobs:
           Add-Type -AssemblyName System.Reflection.Metadata
 
           $stream = [System.IO.File]::OpenRead($env:INSTALLER_PATH)
+          $pe = $null
           try {
             $pe = [System.Reflection.PortableExecutable.PEReader]::new($stream)
-            $reader = $pe.GetMetadataReader()
+            $reader = [System.Reflection.Metadata.PEReaderExtensions]::GetMetadataReader($pe)
 
             Write-Host "=== ASSEMBLY REFERENCES ==="
             foreach ($handle in $reader.AssemblyReferences) {
@@ -172,9 +182,10 @@ jobs:
           Add-Type -AssemblyName System.Reflection.Metadata
 
           $stream = [System.IO.File]::OpenRead($env:INSTALLER_PATH)
+          $pe = $null
           try {
             $pe = [System.Reflection.PortableExecutable.PEReader]::new($stream)
-            $reader = $pe.GetMetadataReader()
+            $reader = [System.Reflection.Metadata.PEReaderExtensions]::GetMetadataReader($pe)
 
             Write-Host "=== MANIFEST RESOURCES ==="
             foreach ($handle in $reader.ManifestResources) {
