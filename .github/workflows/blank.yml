@@ -16,17 +16,37 @@ jobs:
 
       - name: Make sure WinGet exists
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-            Write-Host "WinGet missing - bootstrapping official Microsoft WinGet client..."
+          $ErrorActionPreference = "Stop"
 
-            Install-PackageProvider -Name NuGet -Force | Out-Null
-            Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-            Install-Module -Name Microsoft.WinGet.Client -Force -Repository PSGallery | Out-Null
-            Repair-WinGetPackageManager -AllUsers
-          }
+          Write-Host "PowerShell:"
+          $PSVersionTable
 
-          winget --info
+          Write-Host "Checking PSResourceGet..."
+          Get-Command Install-PSResource -ErrorAction Stop
+
+          Write-Host "Installing official Microsoft WinGet PowerShell client..."
+          Install-PSResource `
+            -Name Microsoft.WinGet.Client `
+            -Repository PSGallery `
+            -TrustRepository `
+            -Reinstall
+
+          Import-Module Microsoft.WinGet.Client
+
+          Write-Host "Installing/repairing WinGet..."
+          Repair-WinGetPackageManager -Latest -Force
+
+          $wingetLinks = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links"
+          $env:Path = "$wingetLinks;$env:Path"
+          Add-Content -Path $env:GITHUB_PATH -Value $wingetLinks
+
+          Write-Host "WinGet version:"
+          winget --version
+
+          Write-Host "WinGet sources:"
           winget source list
 
       - name: Check Minecraft in Microsoft Store
