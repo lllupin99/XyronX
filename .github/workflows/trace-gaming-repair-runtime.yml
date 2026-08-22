@@ -1,0 +1,286 @@
+name: Trace GamingRepair runtime blocker
+
+on:
+  workflow_dispatch:
+    inputs:
+      accept_launcher_eula:
+        description: "I accept the official Minecraft Launcher EULA and allow one install attempt"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  trace-gaming-repair:
+    runs-on: windows-11-arm
+    timeout-minutes: 12
+    env:
+      INSTALLER_URL: https://aka.ms/minecraftClientGameCoreWindows
+      LAUNCHER_PFN: Microsoft.4297127D64EC6_8wekyb3d8bbwe
+
+    steps:
+      - name: Baseline Gaming Services and Windows install state
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "=== SYSTEM ==="
+          Get-ComputerInfo | Select-Object WindowsProductName,WindowsVersion,OsBuildNumber,OsArchitecture | Format-List
+
+          Write-Host "=== PACKAGES BEFORE ==="
+          Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'GamingServices|Xbox|Minecraft|StorePurchaseApp|WindowsStore|DesktopAppInstaller' } |
+            Select-Object Name,PackageFullName,PackageFamilyName,Version,Architecture,InstallLocation,Status |
+            Format-List
+
+          Write-Host "=== SERVICES BEFORE ==="
+          Get-Service -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'Gaming|Xbox|Clip|AppX|InstallService|BITS|wuauserv' -or $_.DisplayName -match 'Gaming|Xbox|Store|AppX|Windows Update' } |
+            Sort-Object Name |
+            Select-Object Name,DisplayName,Status,StartType |
+            Format-Table -AutoSize
+
+          Write-Host "=== RELEVANT EVENT LOGS AVAILABLE ==="
+          Get-WinEvent -ListLog * -ErrorAction SilentlyContinue |
+            Where-Object { $_.LogName -match 'AppX|Store|Clip|Gaming|Xbox|AppModel|WindowsUpdate' } |
+            Select-Object -First 80 -ExpandProperty LogName
+
+      - name: Download and verify official Minecraft installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = Join-Path $env:RUNNER_TEMP "MinecraftInstaller.exe"
+          Invoke-WebRequest -Uri $env:INSTALLER_URL -OutFile $installer -MaximumRedirection 10
+          $sig = Get-AuthenticodeSignature $installer
+          $item = Get-Item $installer
+          Write-Host "INSTALLER_PATH=$installer"
+          Write-Host "INSTALLER_SHA256=$((Get-FileHash $installer -Algorithm SHA256).Hash)"
+          Write-Host "SIGNATURE_STATUS=$($sig.Status)"
+          Write-Host "SIGNER=$($sig.SignerCertificate.Subject)"
+          Write-Host "FILE_VERSION=$($item.VersionInfo.FileVersion)"
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft') {
+            throw "Microsoft Authenticode verification failed."
+          }
+          "INSTALLER_PATH=$installer" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Start official install and trace GamingRepair
+        shell: pwsh
+        env:
+          ACCEPT_LAUNCHER_EULA: ${{ inputs.accept_launcher_eula }}
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          if ($env:ACCEPT_LAUNCHER_EULA -ne 'true') {
+            Write-Host "INSTALL_ATTEMPT_SKIPPED=true"
+            Write-Host "REASON=Explicit EULA consent was not enabled."
+            exit 0
+          }
+
+          Add-Type -AssemblyName UIAutomationClient
+          Add-Type -AssemblyName UIAutomationTypes
+
+          function Get-LauncherPackage {
+            Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
+              Where-Object { $_.PackageFamilyName -eq $env:LAUNCHER_PFN } |
+              Select-Object -First 1
+          }
+
+          function Get-Elements([int]$processId) {
+            try {
+              $root = [System.Windows.Automation.AutomationElement]::RootElement
+              $condition = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ProcessIdProperty,
+                $processId
+              )
+              $collection = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+              $items = @()
+              for ($i = 0; $i -lt $collection.Count; $i++) {
+                $el = $collection.Item($i)
+                try {
+                  $items += [pscustomobject]@{
+                    Element = $el
+                    Name = $el.Current.Name
+                    AutomationId = $el.Current.AutomationId
+                    ControlType = $el.Current.ControlType.ProgrammaticName
+                    Enabled = $el.Current.IsEnabled
+                  }
+                } catch {}
+              }
+              return $items
+            } catch { return @() }
+          }
+
+          function Dump-UI([int]$processId, [string]$label) {
+            Write-Host "=== UI: $label ==="
+            $items = Get-Elements $processId
+            Write-Host "UI_ELEMENT_COUNT=$($items.Count)"
+            $items | Where-Object { $_.Name -or $_.AutomationId } | Select-Object -First 100 | ForEach-Object {
+              $safe = ($_.Name -replace "`r|`n", ' ')
+              Write-Host "UI CONTROL=$($_.ControlType) ENABLED=$($_.Enabled) ID=[$($_.AutomationId)] NAME=[$safe]"
+            }
+            return $items
+          }
+
+          $startTime = Get-Date
+          Write-Host "TRACE_START_UTC=$($startTime.ToUniversalTime().ToString('o'))"
+          Write-Host "STORE_SIGN_IN_AUTOMATION=false"
+          Write-Host "EULA_CONSENT_CONFIRMED_BY_WORKFLOW_INPUT=true"
+
+          $proc = Start-Process -FilePath $env:INSTALLER_PATH -PassThru
+          Write-Host "INSTALLER_PID=$($proc.Id)"
+
+          $checkbox = $null
+          $items = @()
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            Start-Sleep -Seconds 5
+            if ($proc.HasExited) { break }
+            $items = Get-Elements $proc.Id
+            $checkbox = $items | Where-Object {
+              $_.AutomationId -eq 'AgreementCheckbox' -and $_.ControlType -eq 'ControlType.CheckBox'
+            } | Select-Object -First 1
+            Write-Host "UI_WAIT_ATTEMPT=$attempt ELEMENTS=$($items.Count) CHECKBOX_FOUND=$([bool]$checkbox)"
+            if ($checkbox) { break }
+          }
+
+          if (-not $checkbox) {
+            Write-Host "EULA_CHECKBOX_FOUND=false"
+            if (-not $proc.HasExited) { Dump-UI $proc.Id "NO EULA UI" | Out-Null }
+            Get-Process -Name MinecraftInstaller -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            exit 0
+          }
+
+          Write-Host "EULA_CHECKBOX_FOUND=true"
+          $toggleObj = $null
+          if ($checkbox.Element.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$toggleObj)) {
+            $toggle = [System.Windows.Automation.TogglePattern]$toggleObj
+            Write-Host "EULA_TOGGLE_STATE_BEFORE=$($toggle.Current.ToggleState)"
+            if ($toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::Off) { $toggle.Toggle() }
+            Start-Sleep -Seconds 3
+          }
+
+          $items = Get-Elements $proc.Id
+          $install = $items | Where-Object {
+            $_.AutomationId -eq 'ContinueButton' -and $_.ControlType -eq 'ControlType.Button'
+          } | Select-Object -First 1
+
+          if (-not $install -or -not $install.Enabled) {
+            Write-Host "INSTALL_BUTTON_READY=false"
+            Dump-UI $proc.Id "INSTALL BUTTON NOT READY" | Out-Null
+            Get-Process -Name MinecraftInstaller -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            exit 0
+          }
+
+          $invokeObj = $null
+          if ($install.Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invokeObj)) {
+            ([System.Windows.Automation.InvokePattern]$invokeObj).Invoke()
+            Write-Host "INSTALL_BUTTON_INVOKED=true"
+          } else {
+            Write-Host "INSTALL_BUTTON_INVOKED=false"
+            exit 0
+          }
+
+          $seenRepairPid = $null
+          $lastProcessState = ''
+          $lastPackageState = ''
+          $deadline = (Get-Date).AddMinutes(5)
+
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 5
+
+            $interesting = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match 'Minecraft|Gaming|Xbox|Store|AppInstall|wsappx|Clip|TiWorker|TrustedInstaller|MoUsoCoreWorker|UsoClient' } |
+              Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine |
+              Sort-Object Name,ProcessId
+
+            $processState = ($interesting | ForEach-Object { "$($_.Name):$($_.ProcessId):parent=$($_.ParentProcessId)" }) -join ';'
+            if ($processState -ne $lastProcessState) {
+              Write-Host "=== PROCESS STATE CHANGED ==="
+              $interesting | Format-Table -AutoSize
+              $lastProcessState = $processState
+            }
+
+            $repair = $interesting | Where-Object { $_.Name -ieq 'GamingRepair.exe' } | Select-Object -First 1
+            if ($repair -and $seenRepairPid -ne $repair.ProcessId) {
+              $seenRepairPid = $repair.ProcessId
+              Write-Host "GAMING_REPAIR_SEEN=true"
+              Write-Host "GAMING_REPAIR_PID=$($repair.ProcessId)"
+              Write-Host "GAMING_REPAIR_PARENT_PID=$($repair.ParentProcessId)"
+              Write-Host "GAMING_REPAIR_PATH=$($repair.ExecutablePath)"
+              Write-Host "GAMING_REPAIR_COMMAND_LINE=$($repair.CommandLine)"
+              if ($repair.ExecutablePath -and (Test-Path $repair.ExecutablePath)) {
+                $sig = Get-AuthenticodeSignature $repair.ExecutablePath
+                Write-Host "GAMING_REPAIR_SHA256=$((Get-FileHash $repair.ExecutablePath -Algorithm SHA256).Hash)"
+                Write-Host "GAMING_REPAIR_SIGNATURE_STATUS=$($sig.Status)"
+                Write-Host "GAMING_REPAIR_SIGNER=$($sig.SignerCertificate.Subject)"
+                $vi = (Get-Item $repair.ExecutablePath).VersionInfo
+                Write-Host "GAMING_REPAIR_FILE_VERSION=$($vi.FileVersion)"
+                Write-Host "GAMING_REPAIR_PRODUCT=$($vi.ProductName)"
+              }
+            }
+
+            $pkgs = Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match 'GamingServices|Minecraft|Xbox' } |
+              Select-Object Name,PackageFullName,Version,Status
+            $packageState = ($pkgs | ForEach-Object { "$($_.Name):$($_.Version):$($_.Status)" }) -join ';'
+            if ($packageState -ne $lastPackageState) {
+              Write-Host "=== PACKAGE STATE CHANGED ==="
+              $pkgs | Format-Table -AutoSize
+              $lastPackageState = $packageState
+            }
+
+            if (Get-LauncherPackage) {
+              Write-Host "LAUNCHER_INSTALLED=true"
+              break
+            }
+            if ($proc.HasExited) {
+              Write-Host "INSTALLER_EXITED=true"
+              Write-Host "INSTALLER_EXIT_CODE=$($proc.ExitCode)"
+              break
+            }
+          }
+
+          if (-not (Get-LauncherPackage)) { Write-Host "LAUNCHER_INSTALLED=false" }
+          if (-not $seenRepairPid) { Write-Host "GAMING_REPAIR_SEEN=false" }
+          if (-not $proc.HasExited) { Dump-UI $proc.Id "FINAL INSTALLER STATE" | Out-Null }
+
+          Write-Host "=== SERVICES AFTER ==="
+          Get-Service -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'Gaming|Xbox|Clip|AppX|InstallService|BITS|wuauserv' -or $_.DisplayName -match 'Gaming|Xbox|Store|AppX|Windows Update' } |
+            Sort-Object Name |
+            Select-Object Name,DisplayName,Status,StartType |
+            Format-Table -AutoSize
+
+          Write-Host "=== PACKAGES AFTER ==="
+          Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'GamingServices|Xbox|Minecraft|StorePurchaseApp|WindowsStore|DesktopAppInstaller' } |
+            Select-Object Name,PackageFullName,PackageFamilyName,Version,Architecture,Status |
+            Format-List
+
+          Write-Host "=== RELEVANT WINDOWS EVENTS SINCE TRACE START ==="
+          $candidateLogs = Get-WinEvent -ListLog * -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.IsEnabled -and $_.RecordCount -gt 0 -and
+              $_.LogName -match 'AppXDeployment|AppModel-Runtime|Store|Clip|Gaming|Xbox|WindowsUpdateClient'
+            } |
+            Select-Object -ExpandProperty LogName
+
+          foreach ($log in ($candidateLogs | Select-Object -First 30)) {
+            try {
+              $events = Get-WinEvent -FilterHashtable @{ LogName=$log; StartTime=$startTime } -ErrorAction Stop |
+                Select-Object -First 25
+              if ($events) {
+                Write-Host "--- EVENT_LOG=$log COUNT=$($events.Count) ---"
+                foreach ($e in $events) {
+                  $msg = (($e.Message -replace "`r|`n", ' ') -replace '\s+', ' ')
+                  if ($msg.Length -gt 700) { $msg = $msg.Substring(0,700) }
+                  Write-Host "EVENT TIME=$($e.TimeCreated.ToUniversalTime().ToString('o')) ID=$($e.Id) LEVEL=$($e.LevelDisplayName) PROVIDER=$($e.ProviderName) MSG=$msg"
+                }
+              }
+            } catch {}
+          }
+
+          Get-Process -Name MinecraftInstaller,GamingRepair -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+
+          Write-Host "FINAL_RESULT=GamingRepair/Gaming Services runtime trace completed; no Microsoft sign-in was automated and no package payload was uploaded."
