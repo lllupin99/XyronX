@@ -1,0 +1,170 @@
+name: Inspect GamingServices activation registration
+
+on:
+  workflow_dispatch:
+    inputs:
+      accept_launcher_eula:
+        description: "I accept the official Minecraft Launcher EULA and allow one Gaming Services materialization attempt"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-activation-registration:
+    runs-on: windows-11-arm
+    timeout-minutes: 8
+    env:
+      INSTALLER_URL: https://aka.ms/minecraftClientGameCoreWindows
+      GAMING_SERVICES_NAME: Microsoft.GamingServices
+
+    steps:
+      - name: Download and verify official installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'MinecraftInstaller.exe'
+          Invoke-WebRequest -Uri $env:INSTALLER_URL -OutFile $installer -MaximumRedirection 10
+          $sig = Get-AuthenticodeSignature $installer
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft') { throw 'Microsoft Authenticode verification failed.' }
+          Write-Host "INSTALLER_SHA256=$((Get-FileHash $installer -Algorithm SHA256).Hash)"
+          Write-Host "SIGNATURE_STATUS=$($sig.Status)"
+          "INSTALLER_PATH=$installer" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Materialize Gaming Services only
+        shell: pwsh
+        env:
+          ACCEPT_LAUNCHER_EULA: ${{ inputs.accept_launcher_eula }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if ($env:ACCEPT_LAUNCHER_EULA -ne 'true') { Write-Host 'INSTALL_ATTEMPT_SKIPPED=true'; exit 0 }
+          Add-Type -AssemblyName UIAutomationClient
+          Add-Type -AssemblyName UIAutomationTypes
+          function Get-Elements([int]$processId) {
+            try {
+              $root = [System.Windows.Automation.AutomationElement]::RootElement
+              $condition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ProcessIdProperty,$processId)
+              $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$condition)
+              $result = @()
+              for ($i=0; $i -lt $all.Count; $i++) {
+                $element=$all.Item($i)
+                try { $result += [pscustomobject]@{Element=$element;Id=$element.Current.AutomationId;Type=$element.Current.ControlType.ProgrammaticName;Enabled=$element.Current.IsEnabled} } catch {}
+              }
+              return $result
+            } catch { return @() }
+          }
+          Write-Host 'STORE_SIGN_IN_AUTOMATION=false'
+          Write-Host 'EULA_CONSENT_CONFIRMED_BY_WORKFLOW_INPUT=true'
+          $proc = Start-Process -FilePath $env:INSTALLER_PATH -PassThru
+          $checkbox=$null
+          for ($attempt=1; $attempt -le 12; $attempt++) {
+            Start-Sleep 5
+            if ($proc.HasExited) { break }
+            $elements=Get-Elements $proc.Id
+            $checkbox=$elements | Where-Object { $_.Id -eq 'AgreementCheckbox' -and $_.Type -eq 'ControlType.CheckBox' } | Select-Object -First 1
+            Write-Host "UI_WAIT_ATTEMPT=$attempt ELEMENTS=$($elements.Count) CHECKBOX_FOUND=$([bool]$checkbox)"
+            if ($checkbox) { break }
+          }
+          if (-not $checkbox) { Write-Host 'EULA_CHECKBOX_FOUND=false'; exit 0 }
+          $pattern=$null
+          if ($checkbox.Element.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern,[ref]$pattern)) {
+            $toggle=[System.Windows.Automation.TogglePattern]$pattern
+            if ($toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::Off) { $toggle.Toggle() }
+          }
+          Start-Sleep 3
+          $elements=Get-Elements $proc.Id
+          $button=$elements | Where-Object { $_.Id -eq 'ContinueButton' -and $_.Type -eq 'ControlType.Button' -and $_.Enabled } | Select-Object -First 1
+          if (-not $button) { Write-Host 'INSTALL_BUTTON_READY=false'; exit 0 }
+          $pattern=$null
+          if ($button.Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$pattern)) { ([System.Windows.Automation.InvokePattern]$pattern).Invoke(); Write-Host 'INSTALL_BUTTON_INVOKED=true' }
+          $gs=$null
+          $deadline=(Get-Date).AddMinutes(5)
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep 10
+            $gs=Get-AppxPackage -Name $env:GAMING_SERVICES_NAME -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($gs) { break }
+            if ($proc.HasExited) { break }
+          }
+          if (-not $gs) { Write-Host 'GAMING_SERVICES_PRESENT=false'; exit 0 }
+          Write-Host "GAMING_SERVICES_PRESENT=true PACKAGE=$($gs.PackageFullName)"
+          "GAMING_SERVICES_ROOT=$($gs.InstallLocation)" | Out-File $env:GITHUB_ENV -Append
+          Get-Process -Name MinecraftInstaller,GamingRepair -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+      - name: Inspect activation registration
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if (-not $env:GAMING_SERVICES_ROOT) { Write-Host 'REGISTRATION_INSPECTION_AVAILABLE=false'; exit 0 }
+          Write-Host 'REGISTRATION_INSPECTION_AVAILABLE=true'
+          Write-Host 'NO_STORE_METHODS_INVOKED=true'
+          Write-Host 'NO_LICENSE_METHODS_INVOKED=true'
+          Write-Host 'NO_PACKAGE_REQUESTS_SUBMITTED=true'
+
+          $manifestPath = Join-Path $env:GAMING_SERVICES_ROOT 'AppxManifest.xml'
+          if (-not (Test-Path $manifestPath)) { Write-Host 'MANIFEST_PRESENT=false'; exit 0 }
+          [xml]$xml = Get-Content -Raw $manifestPath
+          $targets = @(
+            'Microsoft.GamePlatform.Services.Store',
+            'Microsoft.GamePlatform.Services.Licensing',
+            'Microsoft.GamePlatform.Services.PackageRequest',
+            'Microsoft.GamePlatform.Services.PackageQueue',
+            'Microsoft.GamePlatform.Services.ContentAccess',
+            'Microsoft.GamePlatform.Services.Identity.XboxAuthManager'
+          )
+
+          Write-Host '=== MANIFEST ELEMENTS CONTAINING TARGET CLASSES ==='
+          foreach ($target in $targets) {
+            $nodes = $xml.SelectNodes('//*') | Where-Object { $_.OuterXml -like "*$target*" }
+            Write-Host "TARGET=$target MATCHING_NODE_COUNT=$($nodes.Count)"
+            foreach ($node in ($nodes | Select-Object -Last 12)) {
+              $attrs = @()
+              if ($node.Attributes) { foreach ($a in $node.Attributes) { $attrs += "$($a.Name)=$($a.Value)" } }
+              Write-Host "NODE=$($node.Name) ATTRS=$($attrs -join ';')"
+              if ($node.ParentNode) {
+                $pattrs=@(); if ($node.ParentNode.Attributes) { foreach ($a in $node.ParentNode.Attributes) { $pattrs += "$($a.Name)=$($a.Value)" } }
+                Write-Host "PARENT=$($node.ParentNode.Name) ATTRS=$($pattrs -join ';')"
+              }
+            }
+          }
+
+          Write-Host '=== ALL EXTENSIONS / SERVER REGISTRATIONS ==='
+          $extensionNodes = $xml.SelectNodes('//*[local-name()="Extension" or local-name()="OutOfProcessServer" or local-name()="InProcessServer" or local-name()="ComServer" or local-name()="SurrogateServer" or local-name()="ActivatableClass"]')
+          foreach ($node in $extensionNodes) {
+            $outer = $node.OuterXml
+            if ($outer -match 'GamePlatform|gamingservices|PackageRequest|PackageQueue|ContentAccess|XboxAuthManager|Licensing|Store') {
+              $flat = ($outer -replace '\s+',' ')
+              if ($flat.Length -gt 1800) { $flat=$flat.Substring(0,1800) }
+              Write-Host "REGISTRATION_XML=$flat"
+            }
+          }
+
+          Write-Host '=== PACKAGE CAPABILITIES ==='
+          foreach ($node in $xml.SelectNodes('//*[local-name()="Capability" or local-name()="CustomCapability"]')) {
+            $name = $node.GetAttribute('Name')
+            if ($name) { Write-Host "CAPABILITY=$name" }
+          }
+
+          Write-Host '=== ACTIVATION REGISTRY TARGET SEARCH ==='
+          $roots=@('Registry::HKEY_CLASSES_ROOT\ActivatableClasses\Package','Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\WindowsRuntime\ActivatableClassId')
+          foreach ($root in $roots) {
+            if (-not (Test-Path $root)) { continue }
+            foreach ($target in $targets) {
+              Get-ChildItem $root -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.PSChildName -eq $target -or $_.Name -like "*$target*" } |
+                Select-Object -First 10 |
+                ForEach-Object {
+                  Write-Host "REGISTRY_KEY=$($_.Name)"
+                  try {
+                    $props=Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+                    if ($props) {
+                      foreach ($p in $props.PSObject.Properties) {
+                        if ($p.Name -notmatch '^PS') { Write-Host "REGISTRY_VALUE=$($p.Name)=$($p.Value)" }
+                      }
+                    }
+                  } catch {}
+                }
+            }
+          }
+          Write-Host 'FINAL_RESULT=Static activation-registration inspection completed. No Store, licensing, entitlement, or package-submission API was invoked.'
