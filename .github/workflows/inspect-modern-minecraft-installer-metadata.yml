@@ -1,0 +1,266 @@
+name: Inspect modern Minecraft installer metadata
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-modern-installer:
+    runs-on: windows-11-arm
+
+    steps:
+      - name: Download and verify official installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = Join-Path $env:RUNNER_TEMP "minecraft-modern-installer"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $installer = Join-Path $root "MinecraftInstaller.exe"
+
+          Invoke-WebRequest `
+            -Uri "https://aka.ms/minecraftClientGameCoreWindows" `
+            -OutFile $installer `
+            -MaximumRedirection 10
+
+          $file = Get-Item $installer
+          $hash = Get-FileHash $installer -Algorithm SHA256
+          $sig = Get-AuthenticodeSignature $installer
+          $vi = $file.VersionInfo
+
+          Write-Host "=== OFFICIAL INSTALLER ==="
+          Write-Host "SIZE=$($file.Length)"
+          Write-Host "SHA256=$($hash.Hash)"
+          Write-Host "SIGNATURE_STATUS=$($sig.Status)"
+          if ($sig.SignerCertificate) {
+            Write-Host "SIGNER=$($sig.SignerCertificate.Subject)"
+            Write-Host "SIGNER_ISSUER=$($sig.SignerCertificate.Issuer)"
+          }
+          Write-Host "PRODUCT=$($vi.ProductName)"
+          Write-Host "FILE_VERSION=$($vi.FileVersion)"
+          Write-Host "PRODUCT_VERSION=$($vi.ProductVersion)"
+
+          if ($sig.Status -ne 'Valid') {
+            throw "Official installer signature is not valid; aborting static inspection."
+          }
+
+          "INSTALLER_PATH=$installer" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Confirm CLR metadata exists without executing installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Add-Type -AssemblyName System.Reflection.Metadata
+
+          $stream = [System.IO.File]::OpenRead($env:INSTALLER_PATH)
+          try {
+            $pe = [System.Reflection.PortableExecutable.PEReader]::new($stream)
+            Write-Host "=== PE / CLR ==="
+            Write-Host "HAS_METADATA=$($pe.HasMetadata)"
+            Write-Host "IS_MANAGED=$($pe.PEHeaders.CorHeader -ne $null)"
+
+            if (-not $pe.HasMetadata) {
+              throw "Installer does not expose CLR metadata."
+            }
+          }
+          finally {
+            if ($pe) { $pe.Dispose() }
+            $stream.Dispose()
+          }
+
+      - name: List relevant managed types and methods
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Add-Type -AssemblyName System.Reflection.Metadata
+
+          $keywords = @(
+            'Gaming',
+            'GamingServices',
+            'Xbox',
+            'Store',
+            'Package',
+            'Install',
+            'Repair',
+            'Launcher',
+            'Minecraft',
+            'Entitlement',
+            'License',
+            'Uri',
+            'Appx',
+            'MSIX',
+            'GDK',
+            'GameCore'
+          )
+
+          $stream = [System.IO.File]::OpenRead($env:INSTALLER_PATH)
+          try {
+            $pe = [System.Reflection.PortableExecutable.PEReader]::new($stream)
+            $reader = $pe.GetMetadataReader()
+
+            Write-Host "=== RELEVANT MANAGED TYPE / METHOD NAMES ==="
+
+            foreach ($typeHandle in $reader.TypeDefinitions) {
+              $type = $reader.GetTypeDefinition($typeHandle)
+              $typeName = $reader.GetString($type.Name)
+              $typeNamespace = $reader.GetString($type.Namespace)
+              $fullType = if ($typeNamespace) { "$typeNamespace.$typeName" } else { $typeName }
+
+              $typeMatches = $false
+              foreach ($keyword in $keywords) {
+                if ($fullType -match [regex]::Escape($keyword)) {
+                  $typeMatches = $true
+                  break
+                }
+              }
+
+              $matchingMethods = @()
+              foreach ($methodHandle in $type.GetMethods()) {
+                $method = $reader.GetMethodDefinition($methodHandle)
+                $methodName = $reader.GetString($method.Name)
+                foreach ($keyword in $keywords) {
+                  if ($methodName -match [regex]::Escape($keyword)) {
+                    $matchingMethods += $methodName
+                    break
+                  }
+                }
+              }
+
+              if ($typeMatches -or $matchingMethods.Count -gt 0) {
+                Write-Host "TYPE=$fullType"
+                foreach ($methodName in $matchingMethods | Select-Object -Unique) {
+                  Write-Host "  METHOD=$methodName"
+                }
+              }
+            }
+          }
+          finally {
+            if ($pe) { $pe.Dispose() }
+            $stream.Dispose()
+          }
+
+      - name: List managed assembly references
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Add-Type -AssemblyName System.Reflection.Metadata
+
+          $stream = [System.IO.File]::OpenRead($env:INSTALLER_PATH)
+          try {
+            $pe = [System.Reflection.PortableExecutable.PEReader]::new($stream)
+            $reader = $pe.GetMetadataReader()
+
+            Write-Host "=== ASSEMBLY REFERENCES ==="
+            foreach ($handle in $reader.AssemblyReferences) {
+              $reference = $reader.GetAssemblyReference($handle)
+              $name = $reader.GetString($reference.Name)
+              Write-Host "ASSEMBLY=$name VERSION=$($reference.Version)"
+            }
+          }
+          finally {
+            if ($pe) { $pe.Dispose() }
+            $stream.Dispose()
+          }
+
+      - name: List embedded resource names
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Add-Type -AssemblyName System.Reflection.Metadata
+
+          $stream = [System.IO.File]::OpenRead($env:INSTALLER_PATH)
+          try {
+            $pe = [System.Reflection.PortableExecutable.PEReader]::new($stream)
+            $reader = $pe.GetMetadataReader()
+
+            Write-Host "=== MANIFEST RESOURCES ==="
+            foreach ($handle in $reader.ManifestResources) {
+              $resource = $reader.GetManifestResource($handle)
+              $name = $reader.GetString($resource.Name)
+              Write-Host "RESOURCE=$name OFFSET=$($resource.Offset) ATTRIBUTES=$($resource.Attributes)"
+            }
+          }
+          finally {
+            if ($pe) { $pe.Dispose() }
+            $stream.Dispose()
+          }
+
+      - name: Extract precise static strings around acquisition components
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $bytes = [System.IO.File]::ReadAllBytes($env:INSTALLER_PATH)
+
+          function Get-AsciiStrings([byte[]]$data, [int]$minLength = 5) {
+            $result = New-Object System.Collections.Generic.List[string]
+            $builder = New-Object System.Text.StringBuilder
+            foreach ($b in $data) {
+              if ($b -ge 32 -and $b -le 126) {
+                [void]$builder.Append([char]$b)
+              }
+              else {
+                if ($builder.Length -ge $minLength) {
+                  $result.Add($builder.ToString())
+                }
+                [void]$builder.Clear()
+              }
+            }
+            if ($builder.Length -ge $minLength) {
+              $result.Add($builder.ToString())
+            }
+            return $result
+          }
+
+          $ascii = Get-AsciiStrings $bytes
+          $unicodeText = [System.Text.Encoding]::Unicode.GetString($bytes)
+          $unicode = [regex]::Matches($unicodeText, '[\x20-\x7E]{5,}') | ForEach-Object { $_.Value }
+          $strings = @($ascii) + @($unicode)
+
+          $patterns = @(
+            'Microsoft.GamingServices',
+            'GamingServices',
+            'xgameruntime',
+            'ms-windows-store',
+            '9PGW18NPBZV5',
+            '9NBLGGH2JHXJ',
+            'Microsoft.4297127D64EC6',
+            'Microsoft.MinecraftUWP',
+            'PackageManager',
+            'PackageStatus',
+            'RequestAddPackage',
+            'InstallPackage',
+            'LaunchUri',
+            'StoreContext',
+            'XStore',
+            'entitlement',
+            'license',
+            'repair',
+            'wsreset'
+          )
+
+          Write-Host "=== PRECISE STATIC STRING MATCHES ==="
+          foreach ($pattern in $patterns) {
+            $matches = @(
+              $strings |
+                Where-Object { $_ -match [regex]::Escape($pattern) } |
+                Select-Object -Unique -First 50
+            )
+
+            Write-Host "PATTERN=$pattern COUNT=$($matches.Count)"
+            foreach ($match in $matches) {
+              Write-Host "  $match"
+            }
+          }
+
+      - name: Final marker
+        shell: pwsh
+        run: |
+          Write-Host "=== STATIC METADATA INSPECTION COMPLETE ==="
+          Write-Host "The installer was not executed."
+          Write-Host "No Microsoft account was used."
+          Write-Host "No ownership or licensing result was modified."
+          Write-Host "No Minecraft game package was downloaded."
