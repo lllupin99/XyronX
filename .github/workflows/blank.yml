@@ -11,23 +11,31 @@ jobs:
       - name: System info
         shell: pwsh
         run: |
-          Write-Host "OS:"
-          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture
+          Write-Host "=== SYSTEM ==="
+          Get-ComputerInfo |
+            Select-Object WindowsProductName, WindowsVersion, OsArchitecture
 
-      - name: Make sure WinGet exists
+          Write-Host ""
+          Write-Host "=== REGION / LOCALE ==="
+          Get-Culture
+          Get-WinSystemLocale
+          Get-WinHomeLocation
+
+      - name: Install and verify WinGet
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "PowerShell:"
+          Write-Host "=== POWERSHELL ==="
           $PSVersionTable
 
-          Write-Host "Checking PSResourceGet..."
+          Write-Host ""
+          Write-Host "=== INSTALL PSRESOURCE MODULE ==="
+
           Get-Command Install-PSResource -ErrorAction Stop
 
-          Write-Host "Installing official Microsoft WinGet PowerShell client..."
           Install-PSResource `
             -Name Microsoft.WinGet.Client `
             -Repository PSGallery `
@@ -36,40 +44,151 @@ jobs:
 
           Import-Module Microsoft.WinGet.Client
 
-          Write-Host "Installing/repairing WinGet..."
+          Write-Host ""
+          Write-Host "=== INSTALL / REPAIR WINGET ==="
+
           Repair-WinGetPackageManager -Latest -Force
 
-          $wingetLinks = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links"
-          $env:Path = "$wingetLinks;$env:Path"
-          Add-Content -Path $env:GITHUB_PATH -Value $wingetLinks
+          $wingetLinks = Join-Path `
+            $env:LOCALAPPDATA `
+            "Microsoft\WinGet\Links"
 
-          Write-Host "WinGet version:"
+          $env:Path = "$wingetLinks;$env:Path"
+          Add-Content `
+            -Path $env:GITHUB_PATH `
+            -Value $wingetLinks
+
+          Write-Host ""
+          Write-Host "=== WINGET VERSION ==="
           winget --version
 
-          Write-Host "WinGet sources:"
+          Write-Host ""
+          Write-Host "=== WINGET INFO ==="
+          winget --info
+
+          Write-Host ""
+          Write-Host "=== SOURCES ==="
           winget source list
 
-      - name: Check Minecraft in Microsoft Store
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          Write-Host "=== MICROSOFT STORE CATALOG TEST ==="
+          Write-Host ""
+          Write-Host "=== UPDATE SOURCES ==="
+          winget source update `
+            --accept-source-agreements `
+            --disable-interactivity
 
-          winget show 9NBLGGH2JHXJ `
+      - name: Verify Microsoft Store source works
+        shell: pwsh
+        run: |
+          Write-Host "=== BASELINE MICROSOFT STORE SEARCH ==="
+          Write-Host "Searching for Windows Terminal."
+
+          winget search "Windows Terminal" `
+            --source msstore `
+            --accept-source-agreements `
+            --disable-interactivity
+
+          $exit = $LASTEXITCODE
+
+          Write-Host ""
+          Write-Host "Baseline exit code: $exit"
+
+          if ($exit -ne 0) {
+            Write-Host ""
+            Write-Host "BASELINE_MSSTORE_TEST=FAIL"
+            Write-Host "The runner cannot reliably query msstore."
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "BASELINE_MSSTORE_TEST=PASS"
+
+      - name: Search Minecraft in Microsoft Store
+        shell: pwsh
+        run: |
+          Write-Host "================================="
+          Write-Host "SEARCH 1: Minecraft"
+          Write-Host "================================="
+
+          winget search "Minecraft" `
             --source msstore `
             --accept-source-agreements `
             --disable-interactivity
 
           Write-Host "Exit code: $LASTEXITCODE"
 
-      - name: Test official Minecraft download
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          $out = "$env:RUNNER_TEMP\minecraft-store-test"
-          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Write-Host ""
+          Write-Host "================================="
+          Write-Host "SEARCH 2: Minecraft for Windows"
+          Write-Host "================================="
 
-          Write-Host "=== MICROSOFT OFFICIAL DOWNLOAD TEST ==="
+          winget search "Minecraft for Windows" `
+            --source msstore `
+            --accept-source-agreements `
+            --disable-interactivity
+
+          Write-Host "Exit code: $LASTEXITCODE"
+
+          Write-Host ""
+          Write-Host "================================="
+          Write-Host "SEARCH 3: Microsoft Store ID"
+          Write-Host "9NBLGGH2JHXJ"
+          Write-Host "================================="
+
+          winget search "9NBLGGH2JHXJ" `
+            --source msstore `
+            --accept-source-agreements `
+            --disable-interactivity
+
+          Write-Host "Exit code: $LASTEXITCODE"
+
+          # Do not fail the workflow if Minecraft simply is not exposed
+          # by the Microsoft Store WinGet catalog.
+          exit 0
+
+      - name: Show Minecraft package details
+        shell: pwsh
+        run: |
+          Write-Host "================================="
+          Write-Host "SHOW BY STORE ID"
+          Write-Host "================================="
+
+          winget show "9NBLGGH2JHXJ" `
+            --source msstore `
+            --accept-source-agreements `
+            --disable-interactivity
+
+          Write-Host "Exit code: $LASTEXITCODE"
+
+          Write-Host ""
+          Write-Host "================================="
+          Write-Host "SHOW BY NAME"
+          Write-Host "================================="
+
+          winget show "Minecraft for Windows" `
+            --source msstore `
+            --accept-source-agreements `
+            --disable-interactivity
+
+          Write-Host "Exit code: $LASTEXITCODE"
+
+          exit 0
+
+      - name: Test official Minecraft download by Store ID
+        shell: pwsh
+        run: |
+          $out = Join-Path `
+            $env:RUNNER_TEMP `
+            "minecraft-store-test"
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $out |
+            Out-Null
+
+          Write-Host "================================="
+          Write-Host "MICROSOFT OFFICIAL DOWNLOAD TEST"
+          Write-Host "================================="
 
           winget download `
             --id 9NBLGGH2JHXJ `
@@ -86,26 +205,67 @@ jobs:
           $exit = $LASTEXITCODE
 
           Write-Host ""
-          Write-Host "=== RESULT ==="
+          Write-Host "================================="
+          Write-Host "RESULT"
+          Write-Host "================================="
+
           Write-Host "WinGet exit code: $exit"
 
           Write-Host ""
           Write-Host "=== FILES DOWNLOADED ==="
 
-          if (Test-Path $out) {
-            Get-ChildItem $out -Recurse | Select-Object FullName, Length
-          }
+          $files = Get-ChildItem `
+            $out `
+            -Recurse `
+            -File `
+            -ErrorAction SilentlyContinue
 
-          Write-Host ""
-          Write-Host "=== TOTAL SIZE ==="
+          if ($files) {
+            $files |
+              Select-Object FullName, Length
 
-          if (Test-Path $out) {
             $size = (
-              Get-ChildItem $out -Recurse -File |
+              $files |
               Measure-Object Length -Sum
             ).Sum
 
+            Write-Host ""
+            Write-Host "TOTAL DOWNLOADED SIZE:"
             Write-Host "$size bytes"
+
+            Write-Host ""
+            Write-Host "MICROSOFT_MINECRAFT_DOWNLOAD=FILES_PRESENT"
+          }
+          else {
+            Write-Host "No files downloaded."
+
+            Write-Host ""
+            Write-Host "MICROSOFT_MINECRAFT_DOWNLOAD=NO_FILES"
           }
 
+          # We want the diagnostic output even when Microsoft refuses
+          # or does not expose the package.
           exit 0
+
+      - name: Final result summary
+        shell: pwsh
+        run: |
+          Write-Host "================================="
+          Write-Host "TEST COMPLETE"
+          Write-Host "================================="
+
+          Write-Host ""
+          Write-Host "Interpret the previous steps:"
+          Write-Host ""
+          Write-Host "1. If the baseline Store search failed:"
+          Write-Host "   the GitHub runner/msstore environment is the problem."
+          Write-Host ""
+          Write-Host "2. If baseline passed but every Minecraft search returned:"
+          Write-Host "   'No package found matching input criteria'"
+          Write-Host "   then Minecraft is not being exposed by this msstore catalog path."
+          Write-Host ""
+          Write-Host "3. If Minecraft appears but download asks for authentication:"
+          Write-Host "   Microsoft exposes the package, but acquisition has an auth requirement."
+          Write-Host ""
+          Write-Host "4. If files downloaded:"
+          Write-Host "   inspect the result before drawing conclusions about licensing or usability."
