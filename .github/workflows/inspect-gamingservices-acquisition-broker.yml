@@ -15,7 +15,7 @@ permissions:
 jobs:
   inspect-gamingservices:
     runs-on: windows-11-arm
-    timeout-minutes: 12
+    timeout-minutes: 15
     env:
       INSTALLER_URL: https://aka.ms/minecraftClientGameCoreWindows
       GAMING_SERVICES_NAME: Microsoft.GamingServices
@@ -121,12 +121,10 @@ jobs:
           }
 
           "GAMING_SERVICES_INSTALL_LOCATION=$($gs.InstallLocation)" | Out-File $env:GITHUB_ENV -Append
-          "GAMING_SERVICES_PACKAGE_FULL_NAME=$($gs.PackageFullName)" | Out-File $env:GITHUB_ENV -Append
-
           Get-Process -Name MinecraftInstaller,GamingRepair -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           Write-Host 'OFFICIAL_INSTALL_FLOW_STOPPED_AFTER_GAMING_SERVICES_MATERIALIZED=true'
 
-      - name: Inspect Gaming Services package and acquisition clues
+      - name: Focused Gaming Services Bedrock broker trace
         shell: pwsh
         run: |
           $ErrorActionPreference='Continue'
@@ -139,39 +137,38 @@ jobs:
           $root=$pkg.InstallLocation
           Write-Host 'PACKAGE_INSPECTION_AVAILABLE=true'
           Write-Host "PACKAGE_FULL_NAME=$($pkg.PackageFullName)"
-          Write-Host "PACKAGE_FAMILY_NAME=$($pkg.PackageFamilyName)"
           Write-Host "VERSION=$($pkg.Version)"
           Write-Host "ARCHITECTURE=$($pkg.Architecture)"
-          Write-Host "INSTALL_LOCATION=$root"
           Write-Host "SIGNATURE_KIND=$($pkg.SignatureKind)"
 
+          Write-Host '=== MANIFEST BROKER CLUES ==='
           $manifest=Join-Path $root 'AppxManifest.xml'
           if(Test-Path $manifest) {
-            Write-Host '=== MANIFEST RELEVANT LINES ==='
-            Select-String -Path $manifest -Pattern 'Application|Executable|EntryPoint|Capability|Extension|Service|Protocol|RuntimeBehavior|TrustLevel|windows.' -CaseSensitive:$false |
-              Select-Object -First 220 |
+            Select-String -Path $manifest -Pattern 'packageManagement|packageQuery|packagePolicySystem|Microsoft.GamePlatform.Services.(Store|Licensing|PackageRequest|PackageQueue|PackageSpecifier|Package|ContentAccess|Identity)' -CaseSensitive:$false |
+              Select-Object -First 120 |
               ForEach-Object { Write-Host "MANIFEST=$($_.Line.Trim())" }
           }
 
-          Write-Host '=== BINARY INVENTORY ==='
-          $bins=Get-ChildItem $root -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.exe','.dll','.winmd' }
-          Write-Host "BINARY_COUNT=$($bins.Count)"
-          $bins | Sort-Object Length -Descending | Select-Object -First 180 | ForEach-Object {
-            $rel=$_.FullName.Substring($root.Length).TrimStart('\\')
-            Write-Host "BIN=$rel SIZE=$($_.Length)"
+          $relativeTargets=@(
+            'gamingservices.dll',
+            'gamingservicesproxy.dll',
+            'gameplatformservices.dll',
+            'installserviceplugin.dll',
+            'gamingrepair.dll',
+            'xgameruntime.dll',
+            'tcui-app.dll',
+            'microsoft.gameplatform.services.dll',
+            'microsoft.gameplatform.services.winmd'
+          )
+          $targets=@()
+          foreach($rel in $relativeTargets) {
+            $p=Join-Path $root $rel
+            if(Test-Path $p) {
+              $targets += Get-Item $p
+              Write-Host "TARGET=$rel SIZE=$((Get-Item $p).Length) SHA256=$((Get-FileHash $p -Algorithm SHA256).Hash)"
+            }
           }
 
-          Write-Host '=== RELEVANT PROCESS / SERVICE STATE ==='
-          Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match 'Gaming|Xbox|Xbl' -or $_.PathName -match 'GamingServices' } |
-            Select-Object Name,DisplayName,State,StartMode,PathName |
-            Format-Table -AutoSize
-          Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match 'gaming|xbox|xbl' -or $_.ExecutablePath -match 'GamingServices' } |
-            Select-Object ProcessId,ParentProcessId,Name,ExecutablePath |
-            Format-Table -AutoSize
-
-          Write-Host '=== ACQUISITION STRING TARGETS ==='
           $needles=@(
             $env:BEDROCK_PRODUCT_ID,
             'StartProductInstallWithOptionsAsync',
@@ -181,65 +178,55 @@ jobs:
             'Windows.Services.Store',
             'StoreContext',
             'XStore',
-            'GamingServices',
-            'Microsoft.GamingServices',
-            'InstallService',
-            'ClipSVC',
             'License',
             'Entitlement',
             'MSIXVC',
             'PackageManager',
-            'WindowsUpdate',
-            'wuapi',
-            'UpdateSession',
-            'IUpdateSession',
-            'tlu.dl.delivery.mp.microsoft.com',
+            'PackageRequest',
+            'PackageQueue',
+            'PackageSpecifier',
+            'ContentAccess',
             '9PGW18NPBZV5'
           )
 
-          function Contains-Bytes([byte[]]$haystack,[byte[]]$needle) {
-            if($needle.Length -eq 0 -or $haystack.Length -lt $needle.Length){return $false}
-            for($i=0;$i -le $haystack.Length-$needle.Length;$i++) {
-              $ok=$true
-              for($j=0;$j -lt $needle.Length;$j++) {
-                if($haystack[$i+$j] -ne $needle[$j]){$ok=$false;break}
-              }
-              if($ok){return $true}
-            }
-            return $false
-          }
-
+          Write-Host '=== FAST TARGETED STRING PRESENCE ==='
+          $rg=Get-Command rg -ErrorAction SilentlyContinue
           foreach($needle in $needles) {
-            $ascii=[System.Text.Encoding]::ASCII.GetBytes($needle)
-            $utf16=[System.Text.Encoding]::Unicode.GetBytes($needle)
             $matches=@()
-            foreach($f in $bins) {
-              try {
-                $bytes=[System.IO.File]::ReadAllBytes($f.FullName)
-                if((Contains-Bytes $bytes $ascii) -or (Contains-Bytes $bytes $utf16)) {
-                  $matches += $f.FullName.Substring($root.Length).TrimStart('\\')
-                }
-              } catch {}
+            foreach($f in $targets) {
+              $hit=$false
+              if($rg) {
+                & $rg.Source -a -q -F -- "$needle" $f.FullName 2>$null
+                if($LASTEXITCODE -eq 0){$hit=$true}
+              } else {
+                try {
+                  $text=[System.Text.Encoding]::Latin1.GetString([System.IO.File]::ReadAllBytes($f.FullName))
+                  if($text.Contains($needle,[System.StringComparison]::OrdinalIgnoreCase)){$hit=$true}
+                } catch {}
+              }
+              if($hit){$matches += $f.Name}
             }
-            Write-Host "NEEDLE=$needle MATCH_FILE_COUNT=$($matches.Count)"
-            $matches | Select-Object -First 80 | ForEach-Object { Write-Host "MATCH_FILE=$_" }
+            Write-Host "NEEDLE=$needle MATCH_FILE_COUNT=$($matches.Count) FILES=$($matches -join ',')"
           }
 
-          Write-Host '=== PE IMPORT CLUES ==='
+          Write-Host '=== PE IMPORT / EXPORT CLUES ==='
           $dumpbin=Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio" -Filter dumpbin.exe -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
           if($dumpbin) {
             Write-Host "DUMPBIN=$($dumpbin.FullName)"
-            $focus=$bins | Where-Object { $_.Name -match 'gamingservices|gamingservicesnet|xbox|store|install|license' } | Select-Object -First 30
-            foreach($f in $focus) {
-              $rel=$f.FullName.Substring($root.Length).TrimStart('\\')
-              Write-Host "--- IMPORTS FILE=$rel ---"
+            foreach($f in $targets | Where-Object {$_.Extension -in '.dll','.exe'}) {
+              Write-Host "--- FILE=$($f.Name) IMPORTS ---"
               & $dumpbin.FullName /imports $f.FullName 2>$null |
-                Select-String -Pattern 'store|appx|package|license|clip|winhttp|wininet|rpc|combase|windowsupdate|wuapi|xbox|gaming|xstore' -CaseSensitive:$false |
-                Select-Object -First 120 |
+                Select-String -Pattern 'combase|runtimeobject|appx|package|store|license|clip|winhttp|wininet|rpc|windowsupdate|wuapi|xbox|gaming|xstore' -CaseSensitive:$false |
+                Select-Object -First 80 |
                 ForEach-Object { Write-Host "IMPORT=$($_.Line.Trim())" }
+              Write-Host "--- FILE=$($f.Name) EXPORTS ---"
+              & $dumpbin.FullName /exports $f.FullName 2>$null |
+                Select-String -Pattern 'install|store|license|package|xbox|gaming|xstore|entitle|content' -CaseSensitive:$false |
+                Select-Object -First 80 |
+                ForEach-Object { Write-Host "EXPORT=$($_.Line.Trim())" }
             }
           } else {
             Write-Host 'DUMPBIN_AVAILABLE=false'
           }
 
-          Write-Host "FINAL_RESULT=Gaming Services was materialized by Microsoft's signed installer and statically inspected in place. No Microsoft sign-in was automated, no tokens were collected, no Store capability was forged, and no package payload was uploaded."
+          Write-Host 'FINAL_RESULT=Focused Gaming Services broker inspection completed. No Microsoft sign-in was automated, no tokens were collected, no private Store capability was forged, and no Microsoft package payload was uploaded.'
