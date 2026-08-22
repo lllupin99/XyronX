@@ -1,0 +1,148 @@
+name: Trace GamingServices Bedrock broker metadata
+
+on:
+  workflow_dispatch:
+    inputs:
+      accept_launcher_eula:
+        description: "I accept the official Minecraft Launcher EULA and allow one install attempt"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  trace-bedrock-broker:
+    runs-on: windows-11-arm
+    timeout-minutes: 8
+    env:
+      INSTALLER_URL: https://aka.ms/minecraftClientGameCoreWindows
+      GAMING_SERVICES_NAME: Microsoft.GamingServices
+      BEDROCK_PRODUCT_ID: 9NBLGGH2JHXJ
+
+    steps:
+      - name: Download and verify official installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $installer=Join-Path $env:RUNNER_TEMP 'MinecraftInstaller.exe'
+          Invoke-WebRequest -Uri $env:INSTALLER_URL -OutFile $installer -MaximumRedirection 10
+          $sig=Get-AuthenticodeSignature $installer
+          if($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft') { throw 'Microsoft Authenticode verification failed.' }
+          Write-Host "INSTALLER_SHA256=$((Get-FileHash $installer -Algorithm SHA256).Hash)"
+          Write-Host "SIGNATURE_STATUS=$($sig.Status)"
+          "INSTALLER_PATH=$installer" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Materialize Gaming Services only
+        shell: pwsh
+        env:
+          ACCEPT_LAUNCHER_EULA: ${{ inputs.accept_launcher_eula }}
+        run: |
+          $ErrorActionPreference='Continue'
+          if($env:ACCEPT_LAUNCHER_EULA -ne 'true'){ Write-Host 'INSTALL_ATTEMPT_SKIPPED=true'; exit 0 }
+          Add-Type -AssemblyName UIAutomationClient
+          Add-Type -AssemblyName UIAutomationTypes
+          function Get-Elements([int]$pid) {
+            try {
+              $root=[System.Windows.Automation.AutomationElement]::RootElement
+              $c=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ProcessIdProperty,$pid)
+              $all=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$c)
+              $r=@(); for($i=0;$i -lt $all.Count;$i++){ $e=$all.Item($i); try{$r += [pscustomobject]@{Element=$e;Id=$e.Current.AutomationId;Type=$e.Current.ControlType.ProgrammaticName;Enabled=$e.Current.IsEnabled}}catch{} }; return $r
+            } catch { return @() }
+          }
+          Write-Host 'STORE_SIGN_IN_AUTOMATION=false'
+          $p=Start-Process -FilePath $env:INSTALLER_PATH -PassThru
+          $cb=$null
+          for($i=1;$i -le 12;$i++){ Start-Sleep 5; if($p.HasExited){break}; $els=Get-Elements $p.Id; $cb=$els|Where-Object{$_.Id -eq 'AgreementCheckbox' -and $_.Type -eq 'ControlType.CheckBox'}|Select-Object -First 1; if($cb){break} }
+          if(-not $cb){ Write-Host 'EULA_CHECKBOX_FOUND=false'; exit 0 }
+          $o=$null; if($cb.Element.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern,[ref]$o)){ $t=[System.Windows.Automation.TogglePattern]$o; if($t.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::Off){$t.Toggle()} }
+          Start-Sleep 3
+          $els=Get-Elements $p.Id
+          $btn=$els|Where-Object{$_.Id -eq 'ContinueButton' -and $_.Type -eq 'ControlType.Button' -and $_.Enabled}|Select-Object -First 1
+          if(-not $btn){ Write-Host 'INSTALL_BUTTON_READY=false'; exit 0 }
+          $o=$null; if($btn.Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$o)){ ([System.Windows.Automation.InvokePattern]$o).Invoke(); Write-Host 'INSTALL_BUTTON_INVOKED=true' }
+          $gs=$null; $deadline=(Get-Date).AddMinutes(5)
+          while((Get-Date)-lt $deadline){ Start-Sleep 10; $gs=Get-AppxPackage -AllUsers -Name $env:GAMING_SERVICES_NAME -ErrorAction SilentlyContinue|Select-Object -First 1; if($gs){break}; if($p.HasExited){break} }
+          if(-not $gs){ Write-Host 'GAMING_SERVICES_PRESENT=false'; exit 0 }
+          Write-Host "GAMING_SERVICES_PRESENT=true PACKAGE=$($gs.PackageFullName)"
+          "GAMING_SERVICES_ROOT=$($gs.InstallLocation)" | Out-File $env:GITHUB_ENV -Append
+          Get-Process -Name MinecraftInstaller,GamingRepair -ErrorAction SilentlyContinue|Stop-Process -Force -ErrorAction SilentlyContinue
+
+      - name: Extract Bedrock ID context and WinRT broker metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Continue'
+          if(-not $env:GAMING_SERVICES_ROOT){ Write-Host 'STATIC_TRACE_AVAILABLE=false'; exit 0 }
+          $root=$env:GAMING_SERVICES_ROOT
+          $gs=Join-Path $root 'gamingservices.dll'
+          $winmd=Join-Path $root 'microsoft.gameplatform.services.winmd'
+          Write-Host 'STATIC_TRACE_AVAILABLE=true'
+
+          Write-Host '=== UTF16 BEDROCK PRODUCT ID CONTEXT ==='
+          $py=@'
+import os, re
+p=os.environ['GS_DLL']
+needle=os.environ['BEDROCK_PRODUCT_ID']
+data=open(p,'rb').read()
+patterns=[('ASCII',needle.encode('ascii')),('UTF16LE',needle.encode('utf-16le'))]
+for kind,n in patterns:
+    pos=0; count=0
+    while True:
+        i=data.find(n,pos)
+        if i<0: break
+        count+=1
+        lo=max(0,i-320); hi=min(len(data),i+len(n)+320)
+        chunk=data[lo:hi]
+        if kind=='UTF16LE':
+            text=chunk.decode('utf-16le','ignore')
+        else:
+            text=chunk.decode('latin1','ignore')
+        text=' '.join(re.findall(r'[ -~]{4,}',text))
+        print(f'BEDROCK_ID_HIT_KIND={kind} OFFSET=0x{i:X} CONTEXT={text[:700]}')
+        pos=i+len(n)
+    print(f'BEDROCK_ID_{kind}_COUNT={count}')
+'@
+          $env:GS_DLL=$gs
+          $py | python -
+
+          Write-Host '=== FOCUSED UTF16/ASCII SYMBOL CONTEXT ==='
+          $env:SYMBOLS='StartProductInstallWithOptionsAsync|StartProductInstall|StoreContext|XStore|Entitlement|MSIXVC|PackageRequest|PackageQueue|PackageSpecifier|ContentAccess|ClipGetLicenseData|ClipInstallLicense'
+          $py2=@'
+import os,re
+p=os.environ['GS_DLL']; data=open(p,'rb').read(); syms=os.environ['SYMBOLS'].split('|')
+for s in syms:
+    hits=[]
+    for kind,n in [('ASCII',s.encode()),('UTF16LE',s.encode('utf-16le'))]:
+        i=data.find(n)
+        if i>=0: hits.append(f'{kind}@0x{i:X}')
+    print(f'SYMBOL={s} HITS={",".join(hits) if hits else "NONE"}')
+'@
+          $py2 | python -
+
+          Write-Host '=== WINMD TYPES AND METHODS ==='
+          try { Add-Type -AssemblyName System.Reflection.Metadata } catch {}
+          try { Add-Type -AssemblyName System.Collections.Immutable } catch {}
+          if(Test-Path $winmd) {
+            $stream=[System.IO.File]::OpenRead($winmd)
+            try {
+              $pe=[System.Reflection.PortableExecutable.PEReader]::new($stream)
+              $reader=[System.Reflection.Metadata.PEReaderExtensions]::GetMetadataReader($pe)
+              foreach($h in $reader.TypeDefinitions) {
+                $td=$reader.GetTypeDefinition($h)
+                $ns=$reader.GetString($td.Namespace); $name=$reader.GetString($td.Name); $full=if($ns){"$ns.$name"}else{$name}
+                if($full -match '^Microsoft\.GamePlatform\.Services\.(Store|Licensing|PackageRequest|PackageQueue|PackageSpecifier|ContentAccess|PackageSource|Identity\.(TokenRequest|XboxAuthManager))') {
+                  Write-Host "TYPE=$full"
+                  foreach($mh in $td.GetMethods()) { $m=$reader.GetMethodDefinition($mh); Write-Host "  METHOD=$($reader.GetString($m.Name))" }
+                  foreach($ph in $td.GetProperties()) { $pr=$reader.GetPropertyDefinition($ph); Write-Host "  PROPERTY=$($reader.GetString($pr.Name))" }
+                }
+              }
+            } catch { Write-Host "WINMD_METADATA_ERROR=$($_.Exception.Message)" } finally { if($pe){$pe.Dispose()}; $stream.Dispose() }
+          } else { Write-Host 'WINMD_PRESENT=false' }
+
+          Write-Host '=== GAMINGSERVICES LICENSING IMPORTS ==='
+          $dumpbin=Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio" -Filter dumpbin.exe -Recurse -File -ErrorAction SilentlyContinue|Select-Object -First 1
+          if($dumpbin -and (Test-Path $gs)) {
+            & $dumpbin.FullName /imports $gs 2>$null | Select-String -Pattern 'CLIPC|ClipGet|ClipInstall|ClipGenerate|combase|FindStoreIdForPackage|GetPackageForStoreId|RegisterPackage|WINHTTP|RPCRT4' -CaseSensitive:$false | Select-Object -First 120 | ForEach-Object { Write-Host "IMPORT=$($_.Line.Trim())" }
+          }
+          Write-Host 'FINAL_RESULT=Static Bedrock broker metadata trace completed; no Store call was invoked and no licensing state was modified by this trace.'
