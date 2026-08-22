@@ -1,0 +1,309 @@
+name: Probe GamingServices PackageRuntimeManager apphost
+
+on:
+  workflow_dispatch:
+    inputs:
+      accept_launcher_eula:
+        description: "I accept the official Minecraft Launcher EULA and allow one Gaming Services materialization attempt"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  probe-packageruntime-apphost:
+    runs-on: windows-11-arm
+    timeout-minutes: 12
+    env:
+      INSTALLER_URL: https://aka.ms/minecraftClientGameCoreWindows
+      GAMING_SERVICES_NAME: Microsoft.GamingServices
+      WINDOWS_APP_SDK_VERSION: 1.8.260710003
+
+    steps:
+      - name: Download and verify official installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'MinecraftInstaller.exe'
+          Invoke-WebRequest -Uri $env:INSTALLER_URL -OutFile $installer -MaximumRedirection 10
+          $sig = Get-AuthenticodeSignature $installer
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft') {
+            throw 'Microsoft Authenticode verification failed.'
+          }
+          Write-Host "INSTALLER_SHA256=$((Get-FileHash $installer -Algorithm SHA256).Hash)"
+          Write-Host "SIGNATURE_STATUS=$($sig.Status)"
+          "INSTALLER_PATH=$installer" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Materialize Gaming Services only
+        shell: pwsh
+        env:
+          ACCEPT_LAUNCHER_EULA: ${{ inputs.accept_launcher_eula }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if ($env:ACCEPT_LAUNCHER_EULA -ne 'true') {
+            Write-Host 'INSTALL_ATTEMPT_SKIPPED=true'
+            exit 0
+          }
+
+          Add-Type -AssemblyName UIAutomationClient
+          Add-Type -AssemblyName UIAutomationTypes
+
+          function Get-Elements([int]$processId) {
+            try {
+              $root = [System.Windows.Automation.AutomationElement]::RootElement
+              $condition = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ProcessIdProperty,
+                $processId
+              )
+              $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+              $result = @()
+              for ($i = 0; $i -lt $all.Count; $i++) {
+                $element = $all.Item($i)
+                try {
+                  $result += [pscustomobject]@{
+                    Element = $element
+                    Id = $element.Current.AutomationId
+                    Type = $element.Current.ControlType.ProgrammaticName
+                    Enabled = $element.Current.IsEnabled
+                  }
+                } catch {}
+              }
+              return $result
+            } catch { return @() }
+          }
+
+          Write-Host 'STORE_SIGN_IN_AUTOMATION=false'
+          Write-Host 'EULA_CONSENT_CONFIRMED_BY_WORKFLOW_INPUT=true'
+          $proc = Start-Process -FilePath $env:INSTALLER_PATH -PassThru
+
+          $checkbox = $null
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            Start-Sleep -Seconds 5
+            if ($proc.HasExited) { break }
+            $elements = Get-Elements $proc.Id
+            $checkbox = $elements |
+              Where-Object { $_.Id -eq 'AgreementCheckbox' -and $_.Type -eq 'ControlType.CheckBox' } |
+              Select-Object -First 1
+            Write-Host "UI_WAIT_ATTEMPT=$attempt ELEMENTS=$($elements.Count) CHECKBOX_FOUND=$([bool]$checkbox)"
+            if ($checkbox) { break }
+          }
+          if (-not $checkbox) { Write-Host 'EULA_CHECKBOX_FOUND=false'; exit 0 }
+
+          $pattern = $null
+          if ($checkbox.Element.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
+            $toggle = [System.Windows.Automation.TogglePattern]$pattern
+            if ($toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::Off) { $toggle.Toggle() }
+          }
+          Start-Sleep -Seconds 3
+
+          $elements = Get-Elements $proc.Id
+          $button = $elements |
+            Where-Object { $_.Id -eq 'ContinueButton' -and $_.Type -eq 'ControlType.Button' -and $_.Enabled } |
+            Select-Object -First 1
+          if (-not $button) { Write-Host 'INSTALL_BUTTON_READY=false'; exit 0 }
+
+          $pattern = $null
+          if ($button.Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+            ([System.Windows.Automation.InvokePattern]$pattern).Invoke()
+            Write-Host 'INSTALL_BUTTON_INVOKED=true'
+          }
+
+          $gs = $null
+          $deadline = (Get-Date).AddMinutes(5)
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 10
+            $gs = Get-AppxPackage -Name $env:GAMING_SERVICES_NAME -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($gs) { break }
+            if ($proc.HasExited) { break }
+          }
+          if (-not $gs) { Write-Host 'GAMING_SERVICES_PRESENT=false'; exit 0 }
+
+          Write-Host "GAMING_SERVICES_PRESENT=true PACKAGE=$($gs.PackageFullName)"
+          "GAMING_SERVICES_PFN=$($gs.PackageFamilyName)" | Out-File $env:GITHUB_ENV -Append
+          "GAMING_SERVICES_VERSION=$($gs.Version)" | Out-File $env:GITHUB_ENV -Append
+
+          Get-Process -Name MinecraftInstaller,GamingRepair -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+
+      - name: Build self-contained Windows App SDK apphost probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:GAMING_SERVICES_PFN) {
+            Write-Host 'APPHOST_PROBE_AVAILABLE=false'
+            exit 0
+          }
+
+          $root = Join-Path $env:RUNNER_TEMP 'PackageRuntimeManagerApphostProbe'
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+
+          @'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net8.0-windows10.0.26100.0</TargetFramework>
+              <RuntimeIdentifier>win-arm64</RuntimeIdentifier>
+              <PlatformTarget>ARM64</PlatformTarget>
+              <WindowsPackageType>None</WindowsPackageType>
+              <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+              <Nullable>enable</Nullable>
+              <ImplicitUsings>enable</ImplicitUsings>
+            </PropertyGroup>
+            <ItemGroup>
+              <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260710003" />
+            </ItemGroup>
+          </Project>
+          '@ | Set-Content -Path (Join-Path $root 'PackageRuntimeManagerApphostProbe.csproj') -Encoding UTF8
+
+          @'
+          using System;
+          using System.Diagnostics;
+          using System.Runtime.InteropServices;
+          using Microsoft.Windows.Management.Deployment;
+          using Windows.ApplicationModel;
+
+          internal static class Program
+          {
+              [DllImport("combase.dll")]
+              private static extern int RoInitialize(uint initType);
+              [DllImport("combase.dll")]
+              private static extern void RoUninitialize();
+              [DllImport("combase.dll", CharSet = CharSet.Unicode)]
+              private static extern int WindowsCreateString(string sourceString, int length, out IntPtr hstring);
+              [DllImport("combase.dll")]
+              private static extern int WindowsDeleteString(IntPtr hstring);
+              [DllImport("combase.dll")]
+              private static extern int RoGetActivationFactory(IntPtr activatableClassId, ref Guid iid, out IntPtr factory);
+
+              private static readonly Guid IID_IActivationFactory = new("00000035-0000-0000-C000-000000000046");
+              private static string Hex(int hr) => $"0x{unchecked((uint)hr):X8}";
+
+              private static int Probe(string className)
+              {
+                  int init = RoInitialize(1);
+                  IntPtr h = IntPtr.Zero;
+                  IntPtr factory = IntPtr.Zero;
+                  try
+                  {
+                      int hr = WindowsCreateString(className, className.Length, out h);
+                      if (hr < 0) return hr;
+                      Guid iid = IID_IActivationFactory;
+                      return RoGetActivationFactory(h, ref iid, out factory);
+                  }
+                  finally
+                  {
+                      if (factory != IntPtr.Zero) Marshal.Release(factory);
+                      if (h != IntPtr.Zero) WindowsDeleteString(h);
+                      if (init >= 0) RoUninitialize();
+                  }
+              }
+
+              public static int Main(string[] args)
+              {
+                  Console.WriteLine("NO_STORE_METHODS_INVOKED=true");
+                  Console.WriteLine("NO_LICENSE_METHODS_INVOKED=true");
+                  Console.WriteLine("NO_PACKAGE_REQUESTS_SUBMITTED=true");
+                  Console.WriteLine($"PROCESS_PATH={Environment.ProcessPath}");
+                  Console.WriteLine($"BASE_DIRECTORY={AppContext.BaseDirectory}");
+                  Console.WriteLine($"PROCESS_ARCH={RuntimeInformation.ProcessArchitecture}");
+
+                  int sdkHr = Probe("Microsoft.Windows.Management.Deployment.PackageRuntimeManager");
+                  Console.WriteLine($"WINDOWS_APP_SDK_CLASS=Microsoft.Windows.Management.Deployment.PackageRuntimeManager HRESULT={Hex(sdkHr)} SUCCESS={sdkHr >= 0}");
+
+                  if (args.Length < 2) {
+                      Console.WriteLine("ARGS_VALID=false");
+                      return 0;
+                  }
+
+                  string pfn = args[0];
+                  string[] v = args[1].Split('.');
+                  var version = new PackageVersion {
+                      Major = ushort.Parse(v[0]), Minor = ushort.Parse(v[1]),
+                      Build = ushort.Parse(v[2]), Revision = ushort.Parse(v[3])
+                  };
+
+                  string[] classes = {
+                      "Microsoft.GamePlatform.Services.Store",
+                      "Microsoft.GamePlatform.Services.Licensing",
+                      "Microsoft.GamePlatform.Services.PackageRequest",
+                      "Microsoft.GamePlatform.Services.PackageQueue",
+                      "Microsoft.GamePlatform.Services.ContentAccess",
+                      "Microsoft.GamePlatform.Services.Identity.XboxAuthManager"
+                  };
+
+                  foreach (string c in classes) {
+                      int hr = Probe(c);
+                      Console.WriteLine($"BEFORE_CLASS={c} HRESULT={Hex(hr)} SUCCESS={hr >= 0}");
+                  }
+
+                  PackageRuntimeManager? manager = null;
+                  PackageSetRuntimeDisposition? disposition = null;
+                  try {
+                      manager = PackageRuntimeManager.GetDefault();
+                      Console.WriteLine("PACKAGE_RUNTIME_MANAGER_GET_DEFAULT_SUCCESS=true");
+                      var set = new PackageSet { Id = "XyronX.GamingServices.ApphostProbe" };
+                      set.Items.Add(new PackageSetItem {
+                          Id = "GamingServices",
+                          PackageFamilyName = pfn,
+                          MinVersion = version
+                      });
+                      disposition = manager.AddPackageSet(set);
+                      Console.WriteLine("ADD_PACKAGE_SET_SUCCESS=true");
+                      foreach (var item in disposition.PackageSetItemRuntimeDispositions) {
+                          Console.WriteLine($"RUNTIME_PACKAGE_FULL_NAME={item.PackageFullName}");
+                      }
+                      foreach (string c in classes) {
+                          int hr = Probe(c);
+                          Console.WriteLine($"AFTER_CLASS={c} HRESULT={Hex(hr)} SUCCESS={hr >= 0}");
+                      }
+                  }
+                  catch (Exception ex) {
+                      Console.WriteLine("ADD_PACKAGE_SET_SUCCESS=false");
+                      Console.WriteLine($"PACKAGE_RUNTIME_EXCEPTION_TYPE={ex.GetType().FullName}");
+                      Console.WriteLine($"PACKAGE_RUNTIME_EXCEPTION_HRESULT={Hex(ex.HResult)}");
+                      Console.WriteLine($"PACKAGE_RUNTIME_EXCEPTION_MESSAGE={ex.Message.Replace('\r',' ').Replace('\n',' ')}");
+                  }
+                  finally {
+                      if (manager != null && disposition != null) {
+                          try {
+                              manager.RemovePackageSet(disposition);
+                              Console.WriteLine("REMOVE_PACKAGE_SET_SUCCESS=true");
+                          } catch (Exception ex) {
+                              Console.WriteLine($"REMOVE_PACKAGE_SET_SUCCESS=false HRESULT={Hex(ex.HResult)}");
+                          }
+                      }
+                  }
+
+                  Console.WriteLine("FINAL_RESULT=Apphost PackageRuntimeManager probe completed without invoking Store, license refresh, entitlement mutation, or Gaming Services package submission APIs.");
+                  return 0;
+              }
+          }
+          '@ | Set-Content -Path (Join-Path $root 'Program.cs') -Encoding UTF8
+
+          Push-Location $root
+          dotnet restore
+          dotnet publish -c Release -r win-arm64 --self-contained false --no-restore
+          Pop-Location
+
+          $publish = Join-Path $root 'bin\Release\net8.0-windows10.0.26100.0\win-arm64\publish'
+          Write-Host "PUBLISH_DIR=$publish"
+          Get-ChildItem $publish -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'PackageRuntimeManagerApphostProbe|WindowsAppRuntime|Bootstrap|Deployment' } |
+            Select-Object Name,Length | Format-Table -AutoSize
+          "APPHOST_PUBLISH_DIR=$publish" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Run generated apphost directly
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if (-not $env:APPHOST_PUBLISH_DIR) { Write-Host 'APPHOST_PROBE_AVAILABLE=false'; exit 0 }
+
+          $exe = Join-Path $env:APPHOST_PUBLISH_DIR 'PackageRuntimeManagerApphostProbe.exe'
+          Write-Host "APPHOST_EXE=$exe"
+          Write-Host "APPHOST_EXE_PRESENT=$(Test-Path $exe)"
+          if (-not (Test-Path $exe)) { exit 0 }
+
+          Write-Host "APPHOST_EXE_SHA256=$((Get-FileHash $exe -Algorithm SHA256).Hash)"
+          & $exe $env:GAMING_SERVICES_PFN $env:GAMING_SERVICES_VERSION
