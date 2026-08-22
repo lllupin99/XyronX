@@ -1,0 +1,223 @@
+name: Inspect Xbox Launcher post-signin web flow
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-post-signin-flow:
+    runs-on: windows-11-arm
+
+    steps:
+      - name: Prepare Edge and workspace
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $candidates = @(
+            "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+            "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
+          )
+
+          $edge = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $edge) { throw "Microsoft Edge not found." }
+
+          $root = Join-Path $env:RUNNER_TEMP "xbox-launcher-web-static"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+
+          "EDGE_PATH=$edge" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "STATIC_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          Write-Host "EDGE_PATH=$edge"
+          Write-Host "STATIC_ROOT=$root"
+
+      - name: Collect public Xbox JavaScript bundle URLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Push-Location $env:STATIC_ROOT
+
+          npm init -y | Out-Null
+          npm install playwright-core | Out-Null
+
+          @'
+          import fs from 'node:fs';
+          import { chromium } from 'playwright-core';
+
+          const browser = await chromium.launch({
+            executablePath: process.env.EDGE_PATH,
+            headless: true
+          });
+
+          const context = await browser.newContext({ locale: 'en-US' });
+          const page = await context.newPage();
+
+          const requested = 'https://apps.microsoft.com/detail/9PGW18NPBZV5?hl=en-US&gl=US';
+          const seen = new Set();
+
+          page.on('request', request => {
+            const url = request.url();
+            if (/^https:\/\/assets-xbxweb\.xbox\.com\/xbox-web\/static\/js\/.*\.js(?:\?.*)?$/i.test(url)) {
+              seen.add(url);
+            }
+          });
+
+          console.log(`PAGE_REQUESTED=${requested}`);
+          const response = await page.goto(requested, {
+            waitUntil: 'domcontentloaded',
+            timeout: 60000
+          });
+          console.log(`HTTP_STATUS=${response ? response.status() : 'NO_RESPONSE'}`);
+
+          await page.waitForTimeout(10000);
+
+          console.log(`FINAL_URL=${page.url()}`);
+          console.log(`TITLE=${await page.title()}`);
+
+          const domScripts = await page.locator('script[src]').evaluateAll(nodes =>
+            nodes.map(n => n.src).filter(Boolean)
+          );
+          for (const url of domScripts) {
+            if (/^https:\/\/assets-xbxweb\.xbox\.com\/xbox-web\/static\/js\/.*\.js(?:\?.*)?$/i.test(url)) {
+              seen.add(url);
+            }
+          }
+
+          const urls = [...seen].sort();
+          console.log(`XBOX_JS_BUNDLE_COUNT=${urls.length}`);
+          for (const url of urls) console.log(`XBOX_JS_BUNDLE=${url}`);
+
+          fs.writeFileSync('bundle-urls.json', JSON.stringify(urls, null, 2));
+
+          await context.close();
+          await browser.close();
+          '@ | Set-Content -Path (Join-Path $env:STATIC_ROOT "collect.mjs") -Encoding UTF8
+
+          node .\collect.mjs
+          Pop-Location
+
+      - name: Download only the public JavaScript bundles
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $urls = Get-Content (Join-Path $env:STATIC_ROOT "bundle-urls.json") -Raw | ConvertFrom-Json
+          $bundleDir = Join-Path $env:STATIC_ROOT "bundles"
+          New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
+
+          $index = 0
+          foreach ($url in $urls) {
+            $index++
+            $uri = [Uri]$url
+            $name = [System.IO.Path]::GetFileName($uri.AbsolutePath)
+            $target = Join-Path $bundleDir ("{0:D3}-{1}" -f $index, $name)
+
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $target -MaximumRedirection 5
+              Write-Host "DOWNLOADED=$name SIZE=$((Get-Item $target).Length)"
+            }
+            catch {
+              Write-Host "DOWNLOAD_FAILED=$url ERROR=$($_.Exception.Message)"
+            }
+          }
+
+          "BUNDLE_DIR=$bundleDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Scan public frontend code for post-signin acquisition behavior
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $patterns = @(
+            'purchaseSignIn',
+            'productActions',
+            'get.microsoft.com',
+            'ms-windows-store',
+            'StoreWebInstaller',
+            'web installer',
+            'download',
+            'install',
+            'purchase',
+            'acquire',
+            'entitlement',
+            'ownership',
+            'productId',
+            '9pgw18npbzv5',
+            '9nblggh2jhxj'
+          )
+
+          Write-Host "=== STATIC PUBLIC FRONTEND STRING CONTEXTS ==="
+          Write-Host "These are only strings from JavaScript files publicly served by xbox.com."
+          Write-Host "No Store acquisition endpoint is invoked in this step."
+
+          $files = @(Get-ChildItem $env:BUNDLE_DIR -File -Filter *.js -ErrorAction SilentlyContinue)
+          Write-Host "SCANNED_FILE_COUNT=$($files.Count)"
+
+          foreach ($file in $files) {
+            $text = Get-Content $file.FullName -Raw -ErrorAction SilentlyContinue
+            if (-not $text) { continue }
+
+            $fileHadMatch = $false
+            foreach ($pattern in $patterns) {
+              $matches = [regex]::Matches($text, [regex]::Escape($pattern), [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+              if ($matches.Count -eq 0) { continue }
+
+              if (-not $fileHadMatch) {
+                Write-Host ""
+                Write-Host "=== FILE $($file.Name) ==="
+                $fileHadMatch = $true
+              }
+
+              Write-Host "PATTERN=$pattern COUNT=$($matches.Count)"
+
+              $shown = 0
+              foreach ($match in $matches) {
+                if ($shown -ge 5) { break }
+                $start = [Math]::Max(0, $match.Index - 320)
+                $length = [Math]::Min(900, $text.Length - $start)
+                $context = $text.Substring($start, $length) -replace "[\r\n\t]+", " "
+                Write-Host "CONTEXT=$context"
+                $shown++
+              }
+            }
+          }
+
+      - name: Focus on likely purchase and install functions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host "=== HIGH-SIGNAL IDENTIFIERS ==="
+          $needles = @(
+            'purchaseSignIn',
+            'productActions',
+            'get.microsoft.com',
+            'ms-windows-store',
+            'StoreWebInstaller',
+            '9pgw18npbzv5',
+            '9nblggh2jhxj'
+          )
+
+          foreach ($needle in $needles) {
+            Write-Host ""
+            Write-Host "--- $needle ---"
+            Get-ChildItem $env:BUNDLE_DIR -File -Filter *.js | ForEach-Object {
+              $text = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
+              if ($text -and $text.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                Write-Host "FOUND_IN=$($_.Name)"
+              }
+            }
+          }
+
+          exit 0
+
+      - name: Final marker
+        shell: pwsh
+        run: |
+          Write-Host "=== XBOX POST-SIGNIN STATIC INSPECTION COMPLETE ==="
+          Write-Host "No Microsoft account was used."
+          Write-Host "No authentication token was captured."
+          Write-Host "No GET, purchase, install, or Store protocol action was invoked."
+          Write-Host "Only JavaScript files publicly served by the Xbox website were downloaded and scanned."
