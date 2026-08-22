@@ -1,0 +1,306 @@
+name: Inspect modern Minecraft installer startup arguments
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-startup-arguments:
+    runs-on: windows-11-arm
+
+    steps:
+      - name: Download and verify official installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = Join-Path $env:RUNNER_TEMP "minecraft-installer-startup-inspection"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $installer = Join-Path $root "MinecraftInstaller.exe"
+
+          Invoke-WebRequest `
+            -Uri "https://aka.ms/minecraftClientGameCoreWindows" `
+            -OutFile $installer `
+            -MaximumRedirection 10
+
+          $sig = Get-AuthenticodeSignature $installer
+          $hash = Get-FileHash $installer -Algorithm SHA256
+          $file = Get-Item $installer
+
+          Write-Host "=== OFFICIAL INSTALLER ==="
+          Write-Host "SIZE=$($file.Length)"
+          Write-Host "SHA256=$($hash.Hash)"
+          Write-Host "SIGNATURE_STATUS=$($sig.Status)"
+          if ($sig.SignerCertificate) {
+            Write-Host "SIGNER=$($sig.SignerCertificate.Subject)"
+          }
+
+          if ($sig.Status -ne 'Valid') {
+            throw "Installer signature is not valid; refusing to inspect it."
+          }
+
+          "INSTALLER_PATH=$installer" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "INSPECTION_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build static startup argument analyzer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tool = Join-Path $env:INSPECTION_ROOT "startup-analyzer"
+          New-Item -ItemType Directory -Force -Path $tool | Out-Null
+          Push-Location $tool
+
+          dotnet new console --framework net8.0 --force | Out-Null
+          dotnet add package Mono.Cecil --version 0.11.6 | Out-Null
+
+          @'
+          using System;
+          using System.Collections.Generic;
+          using System.Linq;
+          using System.Text.RegularExpressions;
+          using Mono.Cecil;
+          using Mono.Cecil.Cil;
+
+          if (args.Length != 1)
+          {
+              Console.Error.WriteLine("Expected installer path.");
+              return 2;
+          }
+
+          using var asm = AssemblyDefinition.ReadAssembly(args[0], new ReaderParameters { ReadSymbols = false });
+          var module = asm.MainModule;
+
+          static IEnumerable<TypeDefinition> AllTypes(IEnumerable<TypeDefinition> roots)
+          {
+              foreach (var type in roots)
+              {
+                  yield return type;
+                  foreach (var nested in AllTypes(type.NestedTypes))
+                      yield return nested;
+              }
+          }
+
+          static string OperandText(object? operand) => operand switch
+          {
+              null => "",
+              string s => $"\"{s.Replace("\r", "\\r").Replace("\n", "\\n")}\"",
+              MethodReference m => m.FullName,
+              FieldReference f => f.FullName,
+              TypeReference t => t.FullName,
+              Instruction i => $"IL_{i.Offset:X4}",
+              Instruction[] a => string.Join(",", a.Select(i => $"IL_{i.Offset:X4}")),
+              VariableDefinition v => v.ToString(),
+              ParameterDefinition p => p.ToString(),
+              _ => operand.ToString() ?? ""
+          };
+
+          static bool IsCommandLineApi(MethodReference method)
+          {
+              var full = method.FullName;
+              return full.Contains("System.Environment::GetCommandLineArgs", StringComparison.OrdinalIgnoreCase) ||
+                     full.Contains("System.Environment::get_CommandLine", StringComparison.OrdinalIgnoreCase) ||
+                     full.Contains("System.Windows.StartupEventArgs::get_Args", StringComparison.OrdinalIgnoreCase) ||
+                     full.Contains("CommandLineToArgvW", StringComparison.OrdinalIgnoreCase) ||
+                     full.Contains("GetCommandLineW", StringComparison.OrdinalIgnoreCase) ||
+                     full.Contains("GetCommandLineA", StringComparison.OrdinalIgnoreCase);
+          }
+
+          static bool IsStartupRelevantMethod(MethodDefinition method)
+          {
+              var type = method.DeclaringType.FullName;
+              var name = method.Name;
+
+              var relevantType =
+                  type == "MinecraftInstaller.App" ||
+                  type == "MinecraftInstaller.MainWindow" ||
+                  type.StartsWith("MinecraftInstaller.Pages.", StringComparison.Ordinal);
+
+              if (!relevantType)
+                  return false;
+
+              string[] terms =
+              {
+                  "startup", "start", "install", "agreement", "accept", "continue",
+                  "click", "loaded", "next", "launch", "initialize", "ctor"
+              };
+
+              return method.IsConstructor || terms.Any(t => name.Contains(t, StringComparison.OrdinalIgnoreCase));
+          }
+
+          static bool IsInterestingLiteral(string value)
+          {
+              if (string.IsNullOrWhiteSpace(value))
+                  return false;
+
+              string[] terms =
+              {
+                  "silent", "quiet", "headless", "command", "argument", "startup",
+                  "install", "accept", "agreement", "eula", "launch", "productid",
+                  "deep", "repair", "store", "minecraftlauncherinstallerapp"
+              };
+
+              if (terms.Any(t => value.Contains(t, StringComparison.OrdinalIgnoreCase)))
+                  return true;
+
+              // Potential command-line switches. Ignore WPF resource paths and URLs.
+              if ((value.StartsWith("/", StringComparison.Ordinal) || value.StartsWith("-", StringComparison.Ordinal)) &&
+                  !value.StartsWith("/MinecraftInstaller;component/", StringComparison.OrdinalIgnoreCase) &&
+                  !value.StartsWith("//", StringComparison.Ordinal))
+                  return true;
+
+              return false;
+          }
+
+          var types = AllTypes(module.Types).ToList();
+          var methods = types.SelectMany(t => t.Methods).Where(m => m.HasBody).ToList();
+
+          Console.WriteLine("=== ASSEMBLY / ENTRY POINT ===");
+          Console.WriteLine($"ASSEMBLY={asm.Name.FullName}");
+          Console.WriteLine($"ENTRY_POINT={(asm.EntryPoint == null ? "<none>" : asm.EntryPoint.FullName)}");
+
+          if (asm.EntryPoint is { HasBody: true } entry)
+          {
+              Console.WriteLine("=== ENTRY POINT IL ===");
+              foreach (var ins in entry.Body.Instructions)
+                  Console.WriteLine($"IL_{ins.Offset:X4}: {ins.OpCode} {OperandText(ins.Operand)}");
+          }
+
+          Console.WriteLine();
+          Console.WriteLine("=== COMMAND-LINE API CALL SITES ===");
+          var cliCallCount = 0;
+
+          foreach (var method in methods)
+          {
+              var hits = method.Body.Instructions
+                  .Where(i => i.Operand is MethodReference mr && IsCommandLineApi(mr))
+                  .ToList();
+
+              foreach (var hit in hits)
+              {
+                  cliCallCount++;
+                  Console.WriteLine($"CALLER={method.FullName}");
+                  Console.WriteLine($"TARGET={((MethodReference)hit.Operand).FullName}");
+
+                  var index = method.Body.Instructions.IndexOf(hit);
+                  var start = Math.Max(0, index - 12);
+                  var end = Math.Min(method.Body.Instructions.Count - 1, index + 12);
+                  for (var i = start; i <= end; i++)
+                  {
+                      var ins = method.Body.Instructions[i];
+                      Console.WriteLine($"  IL_{ins.Offset:X4}: {ins.OpCode} {OperandText(ins.Operand)}");
+                  }
+              }
+          }
+
+          Console.WriteLine($"COMMAND_LINE_API_CALL_COUNT={cliCallCount}");
+
+          Console.WriteLine();
+          Console.WriteLine("=== METHODS WITH ARG-LIKE PARAMETERS ===");
+          foreach (var method in types.SelectMany(t => t.Methods))
+          {
+              var argLike = method.Parameters.Where(p =>
+                  p.Name.Contains("arg", StringComparison.OrdinalIgnoreCase) ||
+                  p.Name.Contains("startup", StringComparison.OrdinalIgnoreCase) ||
+                  p.ParameterType.FullName.Contains("StartupEventArgs", StringComparison.OrdinalIgnoreCase))
+                  .ToList();
+
+              if (argLike.Count == 0)
+                  continue;
+
+              Console.WriteLine($"METHOD={method.FullName}");
+              foreach (var p in argLike)
+                  Console.WriteLine($"  PARAM={p.Name} TYPE={p.ParameterType.FullName}");
+          }
+
+          Console.WriteLine();
+          Console.WriteLine("=== INTERESTING MAIN-ASSEMBLY STRING LITERALS ===");
+          var literalHits = 0;
+          var seenLiteralLocations = new HashSet<string>(StringComparer.Ordinal);
+
+          foreach (var method in methods)
+          {
+              foreach (var ins in method.Body.Instructions)
+              {
+                  if (ins.OpCode.Code != Code.Ldstr || ins.Operand is not string value || !IsInterestingLiteral(value))
+                      continue;
+
+                  var key = method.FullName + "\n" + value;
+                  if (!seenLiteralLocations.Add(key))
+                      continue;
+
+                  literalHits++;
+                  Console.WriteLine($"METHOD={method.FullName}");
+                  Console.WriteLine($"  LDSTR={value.Replace("\r", "\\r").Replace("\n", "\\n")}");
+              }
+          }
+          Console.WriteLine($"INTERESTING_LITERAL_COUNT={literalHits}");
+
+          Console.WriteLine();
+          Console.WriteLine("=== STARTUP / INSTALL CONTROL FLOW ===");
+          foreach (var method in methods.Where(IsStartupRelevantMethod))
+          {
+              var relevantInstructions = method.Body.Instructions.Where(ins =>
+                  ins.OpCode.Code == Code.Ldstr ||
+                  (ins.Operand is MethodReference mr &&
+                   (IsCommandLineApi(mr) ||
+                    mr.FullName.Contains("Install", StringComparison.OrdinalIgnoreCase) ||
+                    mr.FullName.Contains("Launch", StringComparison.OrdinalIgnoreCase) ||
+                    mr.FullName.Contains("Agreement", StringComparison.OrdinalIgnoreCase) ||
+                    mr.FullName.Contains("Navigate", StringComparison.OrdinalIgnoreCase) ||
+                    mr.FullName.Contains("Page", StringComparison.OrdinalIgnoreCase) ||
+                    mr.FullName.Contains("Store", StringComparison.OrdinalIgnoreCase))))
+                  .ToList();
+
+              if (relevantInstructions.Count == 0)
+                  continue;
+
+              Console.WriteLine($"METHOD={method.FullName}");
+              foreach (var ins in relevantInstructions)
+                  Console.WriteLine($"  IL_{ins.Offset:X4}: {ins.OpCode} {OperandText(ins.Operand)}");
+          }
+
+          Console.WriteLine();
+          Console.WriteLine("=== PINVOKE IMPORTS WITH COMMAND-LINE RELEVANCE ===");
+          var pinvokeCount = 0;
+          foreach (var method in types.SelectMany(t => t.Methods).Where(m => m.IsPInvokeImpl && m.PInvokeInfo != null))
+          {
+              var import = method.PInvokeInfo.EntryPoint ?? method.Name;
+              if (import.Contains("CommandLine", StringComparison.OrdinalIgnoreCase) ||
+                  import.Contains("Argv", StringComparison.OrdinalIgnoreCase))
+              {
+                  pinvokeCount++;
+                  Console.WriteLine($"PINVOKE={method.FullName} ENTRY={import} MODULE={method.PInvokeInfo.Module.Name}");
+              }
+          }
+          Console.WriteLine($"COMMAND_LINE_PINVOKE_COUNT={pinvokeCount}");
+
+          Console.WriteLine();
+          Console.WriteLine("=== STATIC STARTUP ARGUMENT INSPECTION COMPLETE ===");
+          return 0;
+          '@ | Set-Content -Path (Join-Path $tool "Program.cs") -Encoding UTF8
+
+          dotnet build -c Release
+          "STARTUP_ANALYZER=$tool" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          Pop-Location
+
+      - name: Analyze startup and command-line handling
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Push-Location $env:STARTUP_ANALYZER
+          dotnet run -c Release --no-build -- $env:INSTALLER_PATH
+          Pop-Location
+
+      - name: Final marker
+        shell: pwsh
+        run: |
+          Write-Host "=== INSPECTION COMPLETE ==="
+          Write-Host "MinecraftInstaller.exe was downloaded from Microsoft's official aka.ms endpoint and signature-verified."
+          Write-Host "The installer was NOT executed."
+          Write-Host "No Microsoft account was used."
+          Write-Host "No Store entitlement or ownership result was changed."
+          Write-Host "No Minecraft or Launcher package was installed."
