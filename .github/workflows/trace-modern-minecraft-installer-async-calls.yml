@@ -1,0 +1,225 @@
+name: Trace modern Minecraft installer async Store broker calls
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  trace-async-store-calls:
+    runs-on: windows-11-arm
+
+    steps:
+      - name: Download and verify official installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = Join-Path $env:RUNNER_TEMP "minecraft-installer-async-trace"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $installer = Join-Path $root "MinecraftInstaller.exe"
+
+          Invoke-WebRequest `
+            -Uri "https://aka.ms/minecraftClientGameCoreWindows" `
+            -OutFile $installer `
+            -MaximumRedirection 10
+
+          $sig = Get-AuthenticodeSignature $installer
+          $hash = Get-FileHash $installer -Algorithm SHA256
+
+          Write-Host "=== OFFICIAL INSTALLER ==="
+          Write-Host "SHA256=$($hash.Hash)"
+          Write-Host "SIGNATURE_STATUS=$($sig.Status)"
+          if ($sig.SignerCertificate) {
+            Write-Host "SIGNER=$($sig.SignerCertificate.Subject)"
+          }
+
+          if ($sig.Status -ne 'Valid') {
+            throw "Installer signature is not valid."
+          }
+
+          "INSTALLER_PATH=$installer" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "TRACE_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build recursive IL tracer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tool = Join-Path $env:TRACE_ROOT "trace-tool"
+          New-Item -ItemType Directory -Force -Path $tool | Out-Null
+          Push-Location $tool
+
+          dotnet new console --framework net8.0 --force | Out-Null
+          dotnet add package Mono.Cecil --version 0.11.6 | Out-Null
+
+          @'
+          using System;
+          using System.Collections.Generic;
+          using System.Linq;
+          using Mono.Cecil;
+          using Mono.Cecil.Cil;
+
+          if (args.Length != 1)
+          {
+              Console.Error.WriteLine("Expected installer path.");
+              return 2;
+          }
+
+          using var asm = AssemblyDefinition.ReadAssembly(args[0], new ReaderParameters { ReadSymbols = false });
+          var module = asm.MainModule;
+
+          static IEnumerable<TypeDefinition> AllTypes(IEnumerable<TypeDefinition> roots)
+          {
+              foreach (var t in roots)
+              {
+                  yield return t;
+                  foreach (var n in AllTypes(t.NestedTypes))
+                      yield return n;
+              }
+          }
+
+          var allTypes = AllTypes(module.Types).ToList();
+          var allMethods = allTypes.SelectMany(t => t.Methods).Where(m => m.HasBody).ToList();
+
+          bool IsTargetStateMachine(TypeDefinition t)
+          {
+              var n = t.FullName;
+              return n.Contains("<StartProductInstallAsync>d__", StringComparison.Ordinal) ||
+                     n.Contains("<StartProductInstall>d__", StringComparison.Ordinal) ||
+                     n.Contains("<CanProductBeInstalled>d__", StringComparison.Ordinal) ||
+                     n.Contains("<InstallStoreDependencies>d__", StringComparison.Ordinal) ||
+                     n.Contains("<LaunchIfInstalledAsync>d__", StringComparison.Ordinal) ||
+                     n.Contains("PackageManagerHelper/<Launch>d__", StringComparison.Ordinal);
+          }
+
+          static string OperandText(object? operand) => operand switch
+          {
+              null => "",
+              string s => $"\"{s}\"",
+              MethodReference m => m.FullName,
+              FieldReference f => f.FullName,
+              TypeReference t => t.FullName,
+              Instruction i => $"IL_{i.Offset:X4}",
+              Instruction[] a => string.Join(",", a.Select(i => $"IL_{i.Offset:X4}")),
+              VariableDefinition v => v.ToString(),
+              ParameterDefinition p => p.ToString(),
+              _ => operand.ToString() ?? ""
+          };
+
+          Console.WriteLine("=== ASYNC STATE MACHINE IL ===");
+          foreach (var type in allTypes.Where(IsTargetStateMachine))
+          {
+              Console.WriteLine();
+              Console.WriteLine($"TYPE={type.FullName}");
+              foreach (var method in type.Methods.Where(m => m.HasBody && m.Name == "MoveNext"))
+              {
+                  Console.WriteLine($"METHOD={method.FullName}");
+                  foreach (var ins in method.Body.Instructions)
+                  {
+                      var op = OperandText(ins.Operand);
+                      Console.WriteLine($"  IL_{ins.Offset:X4}: {ins.OpCode} {op}");
+                  }
+              }
+          }
+
+          Console.WriteLine();
+          Console.WriteLine("=== DIRECT CALL SITES TO STORE / PACKAGE BROKERS ===");
+          foreach (var method in allMethods)
+          {
+              var instructions = method.Body.Instructions;
+              for (int i = 0; i < instructions.Count; i++)
+              {
+                  if (instructions[i].Operand is not MethodReference mr)
+                      continue;
+
+                  var full = mr.FullName;
+                  if (!(full.Contains("Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager", StringComparison.OrdinalIgnoreCase) ||
+                        full.Contains("Windows.Management.Deployment.PackageManager", StringComparison.OrdinalIgnoreCase)))
+                      continue;
+
+                  Console.WriteLine();
+                  Console.WriteLine($"CALLER={method.FullName}");
+                  Console.WriteLine($"TARGET={full}");
+                  var start = Math.Max(0, i - 18);
+                  var end = Math.Min(instructions.Count - 1, i + 6);
+                  for (int j = start; j <= end; j++)
+                  {
+                      var ins = instructions[j];
+                      Console.WriteLine($"  IL_{ins.Offset:X4}: {ins.OpCode} {OperandText(ins.Operand)}");
+                  }
+              }
+          }
+
+          Console.WriteLine();
+          Console.WriteLine("=== PRODUCT ID / PACKAGE FAMILY MAPPINGS ===");
+          foreach (var method in allMethods)
+          {
+              var strings = method.Body.Instructions
+                  .Where(i => i.OpCode.Code == Code.Ldstr && i.Operand is string)
+                  .Select(i => (string)i.Operand)
+                  .ToList();
+
+              if (strings.Any(s => s == "9PGW18NPBZV5" || s.Contains("4297127D64EC6", StringComparison.OrdinalIgnoreCase) || s.Contains("Minecraft", StringComparison.OrdinalIgnoreCase)))
+              {
+                  Console.WriteLine($"METHOD={method.FullName}");
+                  foreach (var s in strings.Distinct())
+                  {
+                      if (s == "9PGW18NPBZV5" ||
+                          s.Contains("4297127D64EC6", StringComparison.OrdinalIgnoreCase) ||
+                          s.Contains("Minecraft", StringComparison.OrdinalIgnoreCase))
+                          Console.WriteLine($"  LDSTR={s}");
+                  }
+              }
+          }
+
+          Console.WriteLine();
+          Console.WriteLine("=== CONSTANT / INITIALIZER IL ===");
+          foreach (var type in allTypes.Where(t =>
+              t.FullName == "MinecraftInstaller.Helpers.Constants" ||
+              t.FullName == "MinecraftInstaller.Helpers.InstallStateHelper"))
+          {
+              Console.WriteLine($"TYPE={type.FullName}");
+              foreach (var method in type.Methods.Where(m => m.HasBody && (m.IsConstructor || m.Name == ".cctor")))
+              {
+                  Console.WriteLine($"METHOD={method.FullName}");
+                  foreach (var ins in method.Body.Instructions)
+                      Console.WriteLine($"  IL_{ins.Offset:X4}: {ins.OpCode} {OperandText(ins.Operand)}");
+              }
+          }
+
+          Console.WriteLine();
+          Console.WriteLine("=== MAIN-ASSEMBLY STORE PRODUCT IDS ===");
+          var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+          foreach (var method in allMethods)
+          foreach (var ins in method.Body.Instructions)
+              if (ins.OpCode.Code == Code.Ldstr && ins.Operand is string s &&
+                  System.Text.RegularExpressions.Regex.IsMatch(s, @"^9[A-Z0-9]{10,12}$"))
+                  ids.Add(s);
+
+          foreach (var id in ids.OrderBy(x => x))
+              Console.WriteLine($"PRODUCT_ID_STRING={id}");
+
+          Console.WriteLine("=== TRACE COMPLETE ===");
+          return 0;
+          '@ | Set-Content -Path (Join-Path $tool "Program.cs") -Encoding UTF8
+
+          dotnet build -c Release | Out-Null
+          "TRACE_TOOL=$tool" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Pop-Location
+
+      - name: Trace async broker calls
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Push-Location $env:TRACE_TOOL
+          dotnet run -c Release --no-build -- $env:INSTALLER_PATH
+          Pop-Location
+
+      - name: Final marker
+        shell: pwsh
+        run: |
+          Write-Host "=== ASYNC STORE CALL TRACE COMPLETE ==="
+          Write-Host "Installer was not executed."
+          Write-Host "No Microsoft account was used."
+          Write-Host "No entitlement or ownership result was changed."
+          Write-Host "No Minecraft game package was downloaded."
