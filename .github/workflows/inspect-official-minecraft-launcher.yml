@@ -1,0 +1,314 @@
+name: Inspect official Minecraft Launcher acquisition path
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-launcher:
+    runs-on: windows-11-arm
+
+    steps:
+      - name: System info
+        shell: pwsh
+        run: |
+          Write-Host "=== SYSTEM ==="
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture
+
+      - name: Install and verify WinGet
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Get-Command Install-PSResource -ErrorAction Stop | Out-Null
+
+          Install-PSResource `
+            -Name Microsoft.WinGet.Client `
+            -Repository PSGallery `
+            -TrustRepository `
+            -Reinstall
+
+          Import-Module Microsoft.WinGet.Client
+          Repair-WinGetPackageManager -Latest -Force
+
+          $wingetLinks = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links"
+          $env:Path = "$wingetLinks;$env:Path"
+          Add-Content -Path $env:GITHUB_PATH -Value $wingetLinks
+
+          Write-Host "=== WINGET ==="
+          winget --version
+          winget source list
+          winget source update --disable-interactivity
+
+      - name: Verify msstore baseline
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host "=== BASELINE: WINDOWS TERMINAL ==="
+          winget search "Windows Terminal" `
+            --source msstore `
+            --accept-source-agreements `
+            --disable-interactivity
+
+          $exit = $LASTEXITCODE
+          Write-Host "BASELINE_EXIT=$exit"
+
+          if ($exit -ne 0) {
+            throw "msstore baseline failed; launcher results would not be trustworthy."
+          }
+
+      - name: Query official Minecraft Launcher in Microsoft Store
+        shell: pwsh
+        run: |
+          Write-Host "=== SEARCH BY NAME ==="
+          winget search "Minecraft Launcher" `
+            --source msstore `
+            --accept-source-agreements `
+            --disable-interactivity
+          Write-Host "SEARCH_NAME_EXIT=$LASTEXITCODE"
+
+          Write-Host ""
+          Write-Host "=== SEARCH BY STORE ID 9PGW18NPBZV5 ==="
+          winget search "9PGW18NPBZV5" `
+            --source msstore `
+            --accept-source-agreements `
+            --disable-interactivity
+          Write-Host "SEARCH_ID_EXIT=$LASTEXITCODE"
+
+          Write-Host ""
+          Write-Host "=== SHOW BY STORE ID ==="
+          winget show --id 9PGW18NPBZV5 `
+            --source msstore `
+            --accept-source-agreements `
+            --disable-interactivity
+          Write-Host "SHOW_ID_EXIT=$LASTEXITCODE"
+
+          exit 0
+
+      - name: Test official Launcher package download
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "minecraft-launcher-store"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          Write-Host "=== WINGET DOWNLOAD: OFFICIAL LAUNCHER ==="
+          winget download `
+            --id 9PGW18NPBZV5 `
+            --source msstore `
+            --skip-license `
+            --download-directory $out `
+            --accept-source-agreements `
+            --accept-package-agreements `
+            --disable-interactivity `
+            --verbose-logs
+
+          $exit = $LASTEXITCODE
+          Write-Host "LAUNCHER_DOWNLOAD_EXIT=$exit"
+
+          $files = @(Get-ChildItem $out -Recurse -File -ErrorAction SilentlyContinue)
+          Write-Host "LAUNCHER_DOWNLOAD_FILE_COUNT=$($files.Count)"
+
+          foreach ($file in $files) {
+            $hash = Get-FileHash $file.FullName -Algorithm SHA256
+            $sig = Get-AuthenticodeSignature $file.FullName
+
+            Write-Host "--- FILE ---"
+            Write-Host "NAME=$($file.Name)"
+            Write-Host "SIZE=$($file.Length)"
+            Write-Host "SHA256=$($hash.Hash)"
+            Write-Host "SIGNATURE_STATUS=$($sig.Status)"
+            if ($sig.SignerCertificate) {
+              Write-Host "SIGNER=$($sig.SignerCertificate.Subject)"
+            }
+          }
+
+          exit 0
+
+      - name: Download and inspect Minecraft.net modern Windows installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $out = Join-Path $env:RUNNER_TEMP "minecraft-web-installer"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $installer = Join-Path $out "MinecraftInstaller.exe"
+
+          Write-Host "=== OFFICIAL MINECRAFT.NET INSTALLER ==="
+          Write-Host "SOURCE=https://aka.ms/minecraftClientGameCoreWindows"
+
+          Invoke-WebRequest `
+            -Uri "https://aka.ms/minecraftClientGameCoreWindows" `
+            -OutFile $installer `
+            -MaximumRedirection 10
+
+          $file = Get-Item $installer
+          $hash = Get-FileHash $installer -Algorithm SHA256
+          $sig = Get-AuthenticodeSignature $installer
+          $vi = $file.VersionInfo
+
+          Write-Host "SIZE=$($file.Length)"
+          Write-Host "SHA256=$($hash.Hash)"
+          Write-Host "SIGNATURE_STATUS=$($sig.Status)"
+          if ($sig.SignerCertificate) {
+            Write-Host "SIGNER=$($sig.SignerCertificate.Subject)"
+            Write-Host "SIGNER_ISSUER=$($sig.SignerCertificate.Issuer)"
+          }
+          Write-Host "COMPANY=$($vi.CompanyName)"
+          Write-Host "PRODUCT=$($vi.ProductName)"
+          Write-Host "FILE_VERSION=$($vi.FileVersion)"
+          Write-Host "PRODUCT_VERSION=$($vi.ProductVersion)"
+
+          # Read PE machine type without executing the installer.
+          $bytes = [System.IO.File]::ReadAllBytes($installer)
+          if ($bytes.Length -ge 64 -and $bytes[0] -eq 0x4D -and $bytes[1] -eq 0x5A) {
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+            $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+            $machineName = switch ($machine) {
+              0x014c { "x86" }
+              0x8664 { "x64" }
+              0xAA64 { "arm64" }
+              default { "0x{0:X4}" -f $machine }
+            }
+            Write-Host "PE_MACHINE=$machineName"
+          }
+
+          # Static-only string scan for Microsoft acquisition/runtime clues.
+          function Get-AsciiStrings([byte[]]$data, [int]$minLength = 6) {
+            $result = New-Object System.Collections.Generic.List[string]
+            $builder = New-Object System.Text.StringBuilder
+            foreach ($b in $data) {
+              if ($b -ge 32 -and $b -le 126) {
+                [void]$builder.Append([char]$b)
+              }
+              else {
+                if ($builder.Length -ge $minLength) {
+                  $result.Add($builder.ToString())
+                }
+                [void]$builder.Clear()
+              }
+            }
+            if ($builder.Length -ge $minLength) {
+              $result.Add($builder.ToString())
+            }
+            return $result
+          }
+
+          $ascii = Get-AsciiStrings $bytes
+          $utf16Text = [System.Text.Encoding]::Unicode.GetString($bytes)
+          $utf16 = [regex]::Matches($utf16Text, '[\x20-\x7E]{6,}') | ForEach-Object { $_.Value }
+          $allStrings = @($ascii) + @($utf16)
+
+          $patterns = @(
+            '9PGW18NPBZV5',
+            '9NBLGGH2JHXJ',
+            'Microsoft\.4297127D64EC6',
+            'Microsoft\.MinecraftUWP',
+            'Microsoft\.GamingServices',
+            'GamingServices',
+            'xgameruntime',
+            'XStore',
+            'ms-windows-store',
+            'StoreContext',
+            'Xbox',
+            'AppInstaller',
+            'WindowsApps'
+          )
+
+          Write-Host ""
+          Write-Host "=== STATIC ACQUISITION CLUES ==="
+          foreach ($pattern in $patterns) {
+            $matches = @($allStrings | Where-Object { $_ -match $pattern } | Select-Object -Unique -First 20)
+            Write-Host "PATTERN=$pattern COUNT=$($matches.Count)"
+            foreach ($match in $matches) {
+              Write-Host "  $match"
+            }
+          }
+
+      - name: Install free official Minecraft Launcher package and inspect identity
+        shell: pwsh
+        run: |
+          Write-Host "=== OFFICIAL LAUNCHER INSTALL TEST ==="
+          Write-Host "This installs only the free Minecraft Launcher on the disposable runner."
+          Write-Host "It does not sign in, claim ownership, or install Minecraft for Windows."
+
+          winget install `
+            --id 9PGW18NPBZV5 `
+            --source msstore `
+            --accept-source-agreements `
+            --accept-package-agreements `
+            --disable-interactivity
+
+          $installExit = $LASTEXITCODE
+          Write-Host "LAUNCHER_INSTALL_EXIT=$installExit"
+
+          Write-Host ""
+          Write-Host "=== MATCHING APPX PACKAGES ==="
+          $packages = @(
+            Get-AppxPackage | Where-Object {
+              $_.Name -match 'Minecraft|4297127D64EC6' -or
+              $_.PackageFamilyName -match 'Minecraft|4297127D64EC6'
+            }
+          )
+
+          if ($packages.Count -eq 0) {
+            Write-Host "NO_MATCHING_APPX_PACKAGE"
+            exit 0
+          }
+
+          foreach ($pkg in $packages) {
+            Write-Host "--- PACKAGE ---"
+            Write-Host "NAME=$($pkg.Name)"
+            Write-Host "FULL_NAME=$($pkg.PackageFullName)"
+            Write-Host "FAMILY=$($pkg.PackageFamilyName)"
+            Write-Host "VERSION=$($pkg.Version)"
+            Write-Host "ARCHITECTURE=$($pkg.Architecture)"
+            Write-Host "PUBLISHER=$($pkg.Publisher)"
+            Write-Host "INSTALL_LOCATION=$($pkg.InstallLocation)"
+
+            $manifest = Join-Path $pkg.InstallLocation "AppxManifest.xml"
+            if (Test-Path $manifest) {
+              Write-Host ""
+              Write-Host "=== RELEVANT APPX MANIFEST LINES ==="
+              Get-Content $manifest | Where-Object {
+                $_ -match 'Identity|PackageDependency|TargetDeviceFamily|Application|Executable|EntryPoint|Capability|Extension'
+              }
+            }
+
+            Write-Host ""
+            Write-Host "=== STATIC IMPORT/STRING CLUES IN LAUNCHER BINARIES ==="
+            $candidateBins = Get-ChildItem $pkg.InstallLocation -Recurse -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.Extension -in '.exe', '.dll' } |
+              Select-Object -First 80
+
+            foreach ($bin in $candidateBins) {
+              try {
+                $binBytes = [System.IO.File]::ReadAllBytes($bin.FullName)
+                $binText = [System.Text.Encoding]::ASCII.GetString($binBytes)
+                if ($binText -match 'XStore|xgameruntime|GamingServices|ms-windows-store|9NBLGGH2JHXJ|Microsoft\.MinecraftUWP') {
+                  Write-Host "CLUE_FILE=$($bin.FullName)"
+                  foreach ($needle in @('XStore','xgameruntime','GamingServices','ms-windows-store','9NBLGGH2JHXJ','Microsoft.MinecraftUWP')) {
+                    if ($binText -match [regex]::Escape($needle)) {
+                      Write-Host "  MATCH=$needle"
+                    }
+                  }
+                }
+              }
+              catch {
+                Write-Host "SCAN_SKIPPED=$($bin.FullName)"
+              }
+            }
+          }
+
+          exit 0
+
+      - name: Final interpretation marker
+        shell: pwsh
+        run: |
+          Write-Host "=== RESEARCH COMPLETE ==="
+          Write-Host "No ownership checks were bypassed."
+          Write-Host "No Minecraft game package was requested from a community source."
+          Write-Host "Review launcher catalog/download/install identity and static acquisition clues above."
