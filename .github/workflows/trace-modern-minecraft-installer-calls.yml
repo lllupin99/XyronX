@@ -1,0 +1,201 @@
+name: Trace modern Minecraft installer Store calls
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  trace-installer:
+    runs-on: windows-11-arm
+
+    steps:
+      - name: Download and verify official installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = Join-Path $env:RUNNER_TEMP "minecraft-installer-calltrace"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $installer = Join-Path $root "MinecraftInstaller.exe"
+
+          Invoke-WebRequest `
+            -Uri "https://aka.ms/minecraftClientGameCoreWindows" `
+            -OutFile $installer `
+            -MaximumRedirection 10
+
+          $sig = Get-AuthenticodeSignature $installer
+          $hash = Get-FileHash $installer -Algorithm SHA256
+
+          Write-Host "=== OFFICIAL INSTALLER ==="
+          Write-Host "SHA256=$($hash.Hash)"
+          Write-Host "SIGNATURE_STATUS=$($sig.Status)"
+          if ($sig.SignerCertificate) {
+            Write-Host "SIGNER=$($sig.SignerCertificate.Subject)"
+          }
+
+          if ($sig.Status -ne 'Valid') {
+            throw "Installer signature is not valid."
+          }
+
+          "INSTALLER_PATH=$installer" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "TRACE_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build static IL tracer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tool = Join-Path $env:TRACE_ROOT "trace-tool"
+          New-Item -ItemType Directory -Force -Path $tool | Out-Null
+          Push-Location $tool
+
+          dotnet new console --framework net8.0 --force | Out-Null
+          dotnet add package Mono.Cecil --version 0.11.6 | Out-Null
+
+          @'
+          using System;
+          using System.Collections.Generic;
+          using System.Linq;
+          using Mono.Cecil;
+          using Mono.Cecil.Cil;
+
+          if (args.Length != 1)
+          {
+              Console.Error.WriteLine("Expected installer path.");
+              return 2;
+          }
+
+          var path = args[0];
+          using var asm = AssemblyDefinition.ReadAssembly(path, new ReaderParameters { ReadSymbols = false });
+          var module = asm.MainModule;
+
+          Console.WriteLine("=== RELEVANT TYPE REFERENCES ===");
+          foreach (var tr in module.GetTypeReferences()
+              .Where(t =>
+                  t.FullName.Contains("InstallControl", StringComparison.OrdinalIgnoreCase) ||
+                  t.FullName.Contains("AppInstall", StringComparison.OrdinalIgnoreCase) ||
+                  t.FullName.Contains("PackageManager", StringComparison.OrdinalIgnoreCase) ||
+                  t.FullName.Contains("Gaming", StringComparison.OrdinalIgnoreCase) ||
+                  t.FullName.Contains("Store", StringComparison.OrdinalIgnoreCase))
+              .Select(t => t.FullName)
+              .Distinct()
+              .OrderBy(x => x))
+          {
+              Console.WriteLine($"TYPE_REF={tr}");
+          }
+
+          string[] targetTypes =
+          {
+              "MinecraftInstaller.Helpers.InstallManager",
+              "MinecraftInstaller.Helpers.AppInstallManagerShim",
+              "MinecraftInstaller.Helpers.PackageManagerHelper",
+              "MinecraftInstaller.Helpers.InstallStateHelper",
+              "MinecraftInstaller.MainWindow"
+          };
+
+          bool InterestingMethod(string name) =>
+              new[] { "install", "store", "package", "gaming", "launch", "allowed", "pending", "repair" }
+                  .Any(k => name.Contains(k, StringComparison.OrdinalIgnoreCase));
+
+          foreach (var typeName in targetTypes)
+          {
+              var type = module.Types.FirstOrDefault(t => t.FullName == typeName);
+              if (type == null)
+              {
+                  Console.WriteLine($"TARGET_TYPE_NOT_FOUND={typeName}");
+                  continue;
+              }
+
+              Console.WriteLine();
+              Console.WriteLine($"=== TYPE {type.FullName} ===");
+
+              foreach (var method in type.Methods.Where(m => m.HasBody && InterestingMethod(m.Name)))
+              {
+                  Console.WriteLine();
+                  Console.WriteLine($"METHOD={method.FullName}");
+
+                  foreach (var ins in method.Body.Instructions)
+                  {
+                      if (ins.OpCode.Code == Code.Ldstr && ins.Operand is string s)
+                      {
+                          Console.WriteLine($"  LDSTR={s}");
+                          continue;
+                      }
+
+                      if (ins.Operand is MethodReference mr)
+                      {
+                          var full = mr.FullName;
+                          if (
+                              full.Contains("InstallControl", StringComparison.OrdinalIgnoreCase) ||
+                              full.Contains("AppInstall", StringComparison.OrdinalIgnoreCase) ||
+                              full.Contains("PackageManager", StringComparison.OrdinalIgnoreCase) ||
+                              full.Contains("Gaming", StringComparison.OrdinalIgnoreCase) ||
+                              full.Contains("Store", StringComparison.OrdinalIgnoreCase) ||
+                              full.Contains("Launch", StringComparison.OrdinalIgnoreCase))
+                          {
+                              Console.WriteLine($"  CALL={full}");
+                          }
+                      }
+
+                      if (ins.Operand is FieldReference fr)
+                      {
+                          var full = fr.FullName;
+                          if (
+                              full.Contains("Product", StringComparison.OrdinalIgnoreCase) ||
+                              full.Contains("Store", StringComparison.OrdinalIgnoreCase) ||
+                              full.Contains("Gaming", StringComparison.OrdinalIgnoreCase) ||
+                              full.Contains("Package", StringComparison.OrdinalIgnoreCase))
+                          {
+                              Console.WriteLine($"  FIELD={full}");
+                          }
+                      }
+                  }
+              }
+          }
+
+          Console.WriteLine();
+          Console.WriteLine("=== ALL MAIN-ASSEMBLY PRODUCT-ID STRINGS ===");
+          var productIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+          foreach (var type in module.Types)
+          foreach (var method in type.Methods.Where(m => m.HasBody))
+          foreach (var ins in method.Body.Instructions)
+          {
+              if (ins.OpCode.Code == Code.Ldstr && ins.Operand is string s)
+              {
+                  if (System.Text.RegularExpressions.Regex.IsMatch(s, @"^9[A-Z0-9]{10,12}$"))
+                      productIds.Add(s);
+              }
+          }
+
+          foreach (var id in productIds.OrderBy(x => x))
+              Console.WriteLine($"PRODUCT_ID_STRING={id}");
+
+          Console.WriteLine();
+          Console.WriteLine("=== TRACE COMPLETE ===");
+          return 0;
+          '@ | Set-Content -Path (Join-Path $tool "Program.cs") -Encoding UTF8
+
+          dotnet build -c Release | Out-Null
+          "TRACE_TOOL=$tool" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          Pop-Location
+
+      - name: Trace Store and installation calls without executing installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Push-Location $env:TRACE_TOOL
+          dotnet run -c Release --no-build -- $env:INSTALLER_PATH
+          Pop-Location
+
+      - name: Final marker
+        shell: pwsh
+        run: |
+          Write-Host "=== STATIC CALL TRACE COMPLETE ==="
+          Write-Host "Installer was not executed."
+          Write-Host "No Microsoft account was used."
+          Write-Host "No Store entitlement or ownership result was modified."
+          Write-Host "No Minecraft game package was downloaded."
