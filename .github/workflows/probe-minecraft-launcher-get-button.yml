@@ -1,0 +1,245 @@
+name: Probe Minecraft Launcher GET button behavior
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe-get-button:
+    runs-on: windows-11-arm
+
+    steps:
+      - name: Prepare Edge and download directory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $candidates = @(
+            "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+            "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
+          )
+
+          $edge = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $edge) { throw "Microsoft Edge not found." }
+
+          $downloadDir = Join-Path $env:RUNNER_TEMP "minecraft-launcher-get-downloads"
+          New-Item -ItemType Directory -Force -Path $downloadDir | Out-Null
+
+          "EDGE_PATH=$edge" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "DOWNLOAD_DIR=$downloadDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          Write-Host "EDGE_PATH=$edge"
+          Write-Host "DOWNLOAD_DIR=$downloadDir"
+
+      - name: Build GET-button probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tool = Join-Path $env:RUNNER_TEMP "minecraft-launcher-get-probe"
+          New-Item -ItemType Directory -Force -Path $tool | Out-Null
+          Push-Location $tool
+
+          npm init -y | Out-Null
+          npm install playwright-core | Out-Null
+
+          @'
+          import path from 'node:path';
+          import { chromium } from 'playwright-core';
+
+          const edgePath = process.env.EDGE_PATH;
+          const downloadDir = process.env.DOWNLOAD_DIR;
+          const requestedUrl = 'https://apps.microsoft.com/detail/9PGW18NPBZV5?hl=en-US&gl=US';
+
+          const browser = await chromium.launch({
+            executablePath: edgePath,
+            headless: true,
+            downloadsPath: downloadDir
+          });
+
+          const context = await browser.newContext({
+            acceptDownloads: true,
+            locale: 'en-US'
+          });
+
+          const page = await context.newPage();
+          const interestingUrls = [];
+          let downloadSeen = false;
+          let popupSeen = false;
+
+          const interesting = url =>
+            /get\.microsoft\.com|apps\.microsoft\.com|xbox\.com|microsoft\.com|ms-windows-store|9pgw18npbzv5|store/i.test(url);
+
+          page.on('request', request => {
+            const url = request.url();
+            if (interesting(url)) {
+              interestingUrls.push(`REQUEST ${request.method()} ${url}`);
+              console.log(`NETWORK_REQUEST=${request.method()} ${url}`);
+            }
+          });
+
+          page.on('response', response => {
+            const url = response.url();
+            if (interesting(url))
+              console.log(`NETWORK_RESPONSE=${response.status()} ${url}`);
+          });
+
+          page.on('console', msg => {
+            const text = msg.text();
+            if (/store|install|download|sign.?in|account|minecraft|launcher/i.test(text))
+              console.log(`PAGE_CONSOLE=${msg.type()}:${text}`);
+          });
+
+          page.on('dialog', async dialog => {
+            console.log(`DIALOG_TYPE=${dialog.type()}`);
+            console.log(`DIALOG_MESSAGE=${dialog.message()}`);
+            await dialog.dismiss().catch(() => {});
+          });
+
+          context.on('page', popup => {
+            popupSeen = true;
+            console.log(`NEW_PAGE_INITIAL_URL=${popup.url()}`);
+            popup.on('framenavigated', frame => {
+              if (frame === popup.mainFrame())
+                console.log(`NEW_PAGE_NAVIGATED=${frame.url()}`);
+            });
+          });
+
+          page.on('download', async download => {
+            downloadSeen = true;
+            const suggested = download.suggestedFilename();
+            const target = path.join(downloadDir, suggested);
+            await download.saveAs(target);
+            console.log(`DOWNLOAD_SEEN=true`);
+            console.log(`DOWNLOAD_SUGGESTED_FILENAME=${suggested}`);
+            console.log(`DOWNLOAD_SAVED_AS=${target}`);
+            console.log(`DOWNLOAD_SOURCE_URL=${download.url()}`);
+          });
+
+          console.log(`PAGE_REQUESTED=${requestedUrl}`);
+          const response = await page.goto(requestedUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: 60000
+          });
+          console.log(`INITIAL_HTTP_STATUS=${response ? response.status() : 'NO_RESPONSE'}`);
+
+          await page.waitForTimeout(8000);
+          console.log(`FINAL_PRODUCT_URL=${page.url()}`);
+          console.log(`TITLE=${await page.title()}`);
+
+          const getButton = page.getByRole('button', { name: /Get Minecraft Launcher\. Free/i }).first();
+          const count = await getButton.count();
+          console.log(`GET_BUTTON_COUNT=${count}`);
+
+          if (count === 0) {
+            console.log('RESULT=NO_GET_BUTTON');
+            await context.close();
+            await browser.close();
+            process.exit(0);
+          }
+
+          console.log(`GET_BUTTON_TEXT=${(await getButton.innerText().catch(() => '')).trim()}`);
+          console.log(`GET_BUTTON_ARIA=${await getButton.getAttribute('aria-label')}`);
+          console.log(`GET_BUTTON_DISABLED=${await getButton.isDisabled().catch(() => false)}`);
+
+          const beforeUrl = page.url();
+          console.log(`BEFORE_CLICK_URL=${beforeUrl}`);
+
+          try {
+            await getButton.click({ timeout: 15000 });
+            console.log('GET_CLICK_RESULT=CLICKED');
+          } catch (e) {
+            console.log(`GET_CLICK_RESULT=ERROR:${e.name}:${e.message}`);
+          }
+
+          // Observe only. Do not click any follow-up confirmation, sign-in,
+          // Store-launch, agreement, or install controls.
+          await page.waitForTimeout(15000);
+
+          console.log(`AFTER_CLICK_URL=${page.url()}`);
+          console.log(`DOWNLOAD_SEEN_FINAL=${downloadSeen}`);
+          console.log(`POPUP_SEEN_FINAL=${popupSeen}`);
+
+          const body = await page.locator('body').innerText().catch(() => '');
+          const relevantLines = body
+            .split(/\r?\n/)
+            .map(x => x.trim())
+            .filter(Boolean)
+            .filter(x => /sign.?in|account|microsoft store|open|download|install|get|minecraft|launcher|continue|confirm/i.test(x))
+            .slice(0, 100);
+
+          console.log('=== POST-CLICK VISIBLE TEXT ===');
+          for (const line of relevantLines)
+            console.log(`POST_TEXT=${line}`);
+
+          console.log('=== POST-CLICK CONTROLS ===');
+          const controls = await page.locator('a,button').evaluateAll(nodes => nodes.map(n => ({
+            tag: n.tagName,
+            text: (n.innerText || n.textContent || '').trim().replace(/\s+/g, ' '),
+            aria: n.getAttribute('aria-label') || '',
+            href: n.getAttribute('href') || '',
+            disabled: !!n.disabled
+          })));
+
+          for (const c of controls.filter(c => /sign.?in|account|store|open|download|install|continue|confirm|minecraft|launcher/i.test(`${c.text} ${c.aria} ${c.href}`)).slice(0, 100))
+            console.log(`POST_CONTROL=${JSON.stringify(c)}`);
+
+          console.log('=== INTERESTING NETWORK SUMMARY ===');
+          for (const line of [...new Set(interestingUrls)].slice(0, 200))
+            console.log(line);
+
+          console.log('RESULT=OBSERVATION_COMPLETE');
+
+          await context.close();
+          await browser.close();
+          '@ | Set-Content -Path (Join-Path $tool "probe.mjs") -Encoding UTF8
+
+          "PROBE_TOOL=$tool" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Pop-Location
+
+      - name: Click only the official free GET button and observe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Push-Location $env:PROBE_TOOL
+          node .\probe.mjs
+          Pop-Location
+
+      - name: Verify any downloaded Microsoft stub
+        shell: pwsh
+        run: |
+          Write-Host "=== DOWNLOADED FILE VERIFICATION ==="
+          $files = @(Get-ChildItem $env:DOWNLOAD_DIR -Recurse -File -ErrorAction SilentlyContinue)
+          Write-Host "DOWNLOADED_FILE_COUNT=$($files.Count)"
+
+          foreach ($file in $files) {
+            $hash = Get-FileHash $file.FullName -Algorithm SHA256
+            $sig = Get-AuthenticodeSignature $file.FullName
+            $vi = $file.VersionInfo
+
+            Write-Host "--- FILE ---"
+            Write-Host "NAME=$($file.Name)"
+            Write-Host "SIZE=$($file.Length)"
+            Write-Host "SHA256=$($hash.Hash)"
+            Write-Host "SIGNATURE_STATUS=$($sig.Status)"
+            if ($sig.SignerCertificate) {
+              Write-Host "SIGNER=$($sig.SignerCertificate.Subject)"
+              Write-Host "SIGNER_ISSUER=$($sig.SignerCertificate.Issuer)"
+            }
+            Write-Host "PRODUCT=$($vi.ProductName)"
+            Write-Host "FILE_VERSION=$($vi.FileVersion)"
+          }
+
+          Write-Host "No downloaded executable was executed."
+
+      - name: Final marker
+        shell: pwsh
+        run: |
+          Write-Host "=== GET BUTTON PROBE COMPLETE ==="
+          Write-Host "Only the public Microsoft/Xbox product UI was used."
+          Write-Host "Only the free Minecraft Launcher GET button was clicked."
+          Write-Host "No follow-up confirmation, sign-in, agreement, or install control was clicked."
+          Write-Host "No downloaded installer was executed."
+          Write-Host "No Minecraft game package was downloaded."
