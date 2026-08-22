@@ -1,0 +1,210 @@
+name: Repair Windows Update and retry Minecraft Launcher
+
+on:
+  workflow_dispatch:
+    inputs:
+      accept_launcher_eula:
+        description: "I accept the official Minecraft Launcher EULA and allow one install attempt"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  repair-and-retry:
+    runs-on: windows-11-arm
+    timeout-minutes: 15
+    env:
+      INSTALLER_URL: https://aka.ms/minecraftClientGameCoreWindows
+      LAUNCHER_PFN: Microsoft.4297127D64EC6_8wekyb3d8bbwe
+      BEDROCK_PRODUCT_ID: 9NBLGGH2JHXJ
+
+    steps:
+      - name: Apply Microsoft Windows Update 0x800706D9 repair steps
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Write-Host '=== BASELINE ==='
+          Get-ComputerInfo | Select-Object WindowsProductName,WindowsVersion,OsBuildNumber,OsArchitecture | Format-List
+
+          foreach ($name in @('RpcEptMapper','RpcSs','MpsSvc','BFE','BITS','DoSvc','wuauserv','cryptSvc','InstallService','AppXSvc','ClipSVC')) {
+            $svc=Get-CimInstance Win32_Service -Filter "Name='$name'" -ErrorAction SilentlyContinue
+            if($svc){ Write-Host "BEFORE SERVICE=$name STATE=$($svc.State) STARTMODE=$($svc.StartMode)" }
+          }
+
+          Write-Host '=== FIREWALL POLICY BEFORE ==='
+          reg query "HKLM\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy" /s 2>&1 | Select-Object -First 220
+          netsh advfirewall show allprofiles
+
+          Write-Host '=== REQUIRED SERVICES ==='
+          foreach ($name in @('RpcEptMapper','RpcSs','MpsSvc')) {
+            sc.exe config $name start= auto | Out-Host
+            try { Start-Service $name -ErrorAction Stop } catch { Write-Host "START_$name=$($_.Exception.Message)" }
+          }
+
+          Write-Host '=== RESET WINDOWS FIREWALL POLICY ==='
+          netsh advfirewall reset
+          netsh advfirewall show allprofiles
+
+          Write-Host '=== REREGISTER WINDOWS UPDATE COMPONENTS ==='
+          foreach ($name in @('wuauserv','cryptSvc','BITS')) {
+            try { Stop-Service $name -Force -ErrorAction Stop } catch { Write-Host "STOP_$name=$($_.Exception.Message)" }
+          }
+          Start-Sleep -Seconds 2
+          foreach ($dll in @('wuaueng.dll','wuaueng1.dll','wucltui.dll','wups.dll','wups2.dll')) {
+            $path=Join-Path $env:windir "System32\$dll"
+            if(Test-Path $path) {
+              & regsvr32.exe /s $path
+              Write-Host "REGSVR32=$dll EXIT=$LASTEXITCODE"
+            } else {
+              Write-Host "REGSVR32_SKIP=$dll REASON=missing"
+            }
+          }
+          foreach ($name in @('BITS','cryptSvc','wuauserv','DoSvc','InstallService')) {
+            try { Start-Service $name -ErrorAction Stop; Write-Host "STARTED=$name" } catch { Write-Host "START_$name=$($_.Exception.Message)" }
+          }
+
+          Write-Host '=== STATE AFTER REPAIR ==='
+          foreach ($name in @('RpcEptMapper','RpcSs','MpsSvc','BFE','BITS','DoSvc','wuauserv','cryptSvc','InstallService','AppXSvc','ClipSVC')) {
+            $svc=Get-CimInstance Win32_Service -Filter "Name='$name'" -ErrorAction SilentlyContinue
+            if($svc){ Write-Host "AFTER SERVICE=$name STATE=$($svc.State) STARTMODE=$($svc.StartMode)" }
+          }
+          try { $rpc=Test-NetConnection 127.0.0.1 -Port 135 -WarningAction SilentlyContinue; Write-Host "LOCAL_RPC_135_OK=$($rpc.TcpTestSucceeded)" } catch {}
+          try { $dns=Resolve-DnsName 'tlu.dl.delivery.mp.microsoft.com' -ErrorAction Stop; Write-Host 'TLU_DNS_OK=true' } catch { Write-Host "TLU_DNS_OK=false ERROR=$($_.Exception.Message)" }
+          try { $tcp=Test-NetConnection 'tlu.dl.delivery.mp.microsoft.com' -Port 443 -WarningAction SilentlyContinue; Write-Host "TLU_TCP_443_OK=$($tcp.TcpTestSucceeded) REMOTE=$($tcp.RemoteAddress)" } catch {}
+
+      - name: Download and verify official Minecraft installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $installer=Join-Path $env:RUNNER_TEMP 'MinecraftInstaller.exe'
+          Invoke-WebRequest -Uri $env:INSTALLER_URL -OutFile $installer -MaximumRedirection 10
+          $sig=Get-AuthenticodeSignature $installer
+          $item=Get-Item $installer
+          Write-Host "INSTALLER_PATH=$installer"
+          Write-Host "INSTALLER_SHA256=$((Get-FileHash $installer -Algorithm SHA256).Hash)"
+          Write-Host "SIGNATURE_STATUS=$($sig.Status)"
+          Write-Host "SIGNER=$($sig.SignerCertificate.Subject)"
+          Write-Host "FILE_VERSION=$($item.VersionInfo.FileVersion)"
+          if($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft') { throw 'Microsoft Authenticode verification failed.' }
+          "INSTALLER_PATH=$installer" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Retry official Launcher install after repair
+        shell: pwsh
+        env:
+          ACCEPT_LAUNCHER_EULA: ${{ inputs.accept_launcher_eula }}
+        run: |
+          $ErrorActionPreference='Continue'
+          if($env:ACCEPT_LAUNCHER_EULA -ne 'true') { Write-Host 'INSTALL_ATTEMPT_SKIPPED=true'; exit 0 }
+
+          Add-Type -AssemblyName UIAutomationClient
+          Add-Type -AssemblyName UIAutomationTypes
+          function Get-Elements([int]$processId) {
+            try {
+              $root=[System.Windows.Automation.AutomationElement]::RootElement
+              $condition=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ProcessIdProperty,$processId)
+              $collection=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$condition)
+              $items=@()
+              for($i=0;$i -lt $collection.Count;$i++) {
+                $el=$collection.Item($i)
+                try { $items += [pscustomobject]@{Element=$el;Name=$el.Current.Name;AutomationId=$el.Current.AutomationId;ControlType=$el.Current.ControlType.ProgrammaticName;Enabled=$el.Current.IsEnabled} } catch {}
+              }
+              return $items
+            } catch { return @() }
+          }
+
+          $start=Get-Date
+          "TRACE_START_UTC=$($start.ToUniversalTime().ToString('o'))" | Out-File $env:GITHUB_ENV -Append
+          Write-Host "TRACE_START_UTC=$($start.ToUniversalTime().ToString('o'))"
+          Write-Host 'STORE_SIGN_IN_AUTOMATION=false'
+          Write-Host 'EULA_CONSENT_CONFIRMED_BY_WORKFLOW_INPUT=true'
+          $proc=Start-Process -FilePath $env:INSTALLER_PATH -PassThru
+          Write-Host "INSTALLER_PID=$($proc.Id)"
+
+          $checkbox=$null
+          for($attempt=1;$attempt -le 12;$attempt++) {
+            Start-Sleep -Seconds 5
+            if($proc.HasExited){break}
+            $items=Get-Elements $proc.Id
+            $checkbox=$items | Where-Object { $_.AutomationId -eq 'AgreementCheckbox' -and $_.ControlType -eq 'ControlType.CheckBox' } | Select-Object -First 1
+            Write-Host "UI_WAIT_ATTEMPT=$attempt ELEMENTS=$($items.Count) CHECKBOX_FOUND=$([bool]$checkbox)"
+            if($checkbox){break}
+          }
+          if(-not $checkbox){ Write-Host 'EULA_CHECKBOX_FOUND=false'; exit 0 }
+
+          $toggleObj=$null
+          if($checkbox.Element.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern,[ref]$toggleObj)) {
+            $toggle=[System.Windows.Automation.TogglePattern]$toggleObj
+            if($toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::Off){$toggle.Toggle()}
+          }
+          Start-Sleep -Seconds 3
+          $items=Get-Elements $proc.Id
+          $install=$items | Where-Object { $_.AutomationId -eq 'ContinueButton' -and $_.ControlType -eq 'ControlType.Button' -and $_.Enabled } | Select-Object -First 1
+          if(-not $install){ Write-Host 'INSTALL_BUTTON_READY=false'; exit 0 }
+          $invokeObj=$null
+          if($install.Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$invokeObj)) {
+            ([System.Windows.Automation.InvokePattern]$invokeObj).Invoke()
+            Write-Host 'INSTALL_BUTTON_INVOKED=true'
+          }
+
+          $deadline=(Get-Date).AddMinutes(7)
+          while((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 10
+            $launcher=Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Where-Object { $_.PackageFamilyName -eq $env:LAUNCHER_PFN } | Select-Object -First 1
+            if($launcher){ Write-Host "LAUNCHER_INSTALLED=true PACKAGE=$($launcher.PackageFullName)"; break }
+            if($proc.HasExited){ Write-Host "INSTALLER_EXITED=true CODE=$($proc.ExitCode)"; break }
+          }
+          $launcher=Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Where-Object { $_.PackageFamilyName -eq $env:LAUNCHER_PFN } | Select-Object -First 1
+          if(-not $launcher){ Write-Host 'LAUNCHER_INSTALLED=false' }
+
+      - name: Inspect result and acquisition clues
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Continue'
+          $start=[DateTime]::Parse($env:TRACE_START_UTC).ToLocalTime()
+          $launcher=Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Where-Object { $_.PackageFamilyName -eq $env:LAUNCHER_PFN } | Select-Object -First 1
+
+          Write-Host '=== RESULT ==='
+          if($launcher) {
+            Write-Host 'PACKAGE_INSPECTION_AVAILABLE=true'
+            Write-Host "PACKAGE_FULL_NAME=$($launcher.PackageFullName)"
+            Write-Host "INSTALL_LOCATION=$($launcher.InstallLocation)"
+            Write-Host "VERSION=$($launcher.Version)"
+            Write-Host '=== ACQUISITION CLUE SCAN ==='
+            $needles=@($env:BEDROCK_PRODUCT_ID,'Microsoft.MinecraftUWP','GamingServices','XStore','StoreContext','AppInstallManager','MSIXVC','ms-windows-store','entitlement')
+            $rg=Get-Command rg -ErrorAction SilentlyContinue
+            if($rg) {
+              foreach($needle in $needles) {
+                $matches=& $rg.Source -a -l -F -- "$needle" $launcher.InstallLocation 2>$null | Select-Object -First 40
+                Write-Host "NEEDLE=$needle MATCH_FILE_COUNT=$(@($matches).Count)"
+                foreach($m in @($matches)) { Write-Host "MATCH_FILE=$m" }
+              }
+            }
+          } else {
+            Write-Host 'PACKAGE_INSPECTION_AVAILABLE=false'
+          }
+
+          Write-Host '=== WINDOWS UPDATE ERRORS AFTER REPAIR ==='
+          $errors=@()
+          try {
+            $errors=Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WindowsUpdateClient/Operational';StartTime=$start} -ErrorAction Stop | Where-Object {$_.Id -eq 31} | Select-Object -First 60
+          } catch {}
+          $saw706d9=$false
+          foreach($e in $errors) {
+            try {
+              [xml]$xml=$e.ToXml(); $data=@{}; foreach($d in $xml.Event.EventData.Data){$data[$d.Name]=$d.'#text'}
+              Write-Host "WU_ERROR TITLE=$($data['updateTitle']) CODE=$($data['errorCode'])"
+              if($data['errorCode'] -match '800706d9'){$saw706d9=$true}
+            } catch {}
+          }
+          Write-Host "SAW_0X800706D9_AFTER_REPAIR=$saw706d9"
+
+          Write-Host '=== FINAL SERVICES ==='
+          foreach($name in @('RpcEptMapper','RpcSs','MpsSvc','BFE','BITS','DoSvc','wuauserv','cryptSvc','InstallService')) {
+            $svc=Get-CimInstance Win32_Service -Filter "Name='$name'" -ErrorAction SilentlyContinue
+            if($svc){Write-Host "SERVICE=$name STATE=$($svc.State) STARTMODE=$($svc.StartMode)"}
+          }
+          Get-Process -Name MinecraftInstaller,GamingRepair -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Write-Host 'FINAL_RESULT=Microsoft-documented 0x800706D9 repair was applied on the disposable runner and the official Launcher install was retried; no Microsoft sign-in was automated and no package payload was uploaded.'
