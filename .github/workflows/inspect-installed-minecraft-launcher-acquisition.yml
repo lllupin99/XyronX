@@ -1,0 +1,367 @@
+name: Inspect installed Minecraft Launcher acquisition path
+
+on:
+  workflow_dispatch:
+    inputs:
+      accept_launcher_eula:
+        description: "I accept the official Minecraft Launcher EULA and allow one install attempt"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-launcher:
+    runs-on: windows-11-arm
+    timeout-minutes: 12
+    env:
+      INSTALLER_URL: https://aka.ms/minecraftClientGameCoreWindows
+      LAUNCHER_PFN: Microsoft.4297127D64EC6_8wekyb3d8bbwe
+      LAUNCHER_PRODUCT_ID: 9PGW18NPBZV5
+      BEDROCK_PRODUCT_ID: 9NBLGGH2JHXJ
+
+    steps:
+      - name: System and Store baseline
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "=== SYSTEM ==="
+          Get-ComputerInfo | Select-Object WindowsProductName,WindowsVersion,OsBuildNumber,OsArchitecture | Format-Table -AutoSize
+          Write-Host "PROCESS_ARCH=$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)"
+          Write-Host "OS_ARCH=$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
+          Write-Host "USER=$env:USERNAME"
+
+          Write-Host "=== RELEVANT PACKAGES BEFORE ==="
+          Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.PackageFamilyName -eq $env:LAUNCHER_PFN -or
+              $_.Name -match 'GamingServices|Xbox|Minecraft'
+            } |
+            Select-Object Name,PackageFullName,PackageFamilyName,Version,Architecture,InstallLocation |
+            Format-List
+
+      - name: Download and verify official Minecraft installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = Join-Path $env:RUNNER_TEMP "MinecraftInstaller.exe"
+          Invoke-WebRequest -Uri $env:INSTALLER_URL -OutFile $installer -MaximumRedirection 10
+
+          $hash = (Get-FileHash $installer -Algorithm SHA256).Hash
+          $sig = Get-AuthenticodeSignature $installer
+          $item = Get-Item $installer
+
+          Write-Host "INSTALLER_PATH=$installer"
+          Write-Host "INSTALLER_SIZE=$($item.Length)"
+          Write-Host "INSTALLER_SHA256=$hash"
+          Write-Host "SIGNATURE_STATUS=$($sig.Status)"
+          Write-Host "SIGNER=$($sig.SignerCertificate.Subject)"
+          Write-Host "SIGNER_ISSUER=$($sig.SignerCertificate.Issuer)"
+          Write-Host "FILE_VERSION=$($item.VersionInfo.FileVersion)"
+          Write-Host "PRODUCT=$($item.VersionInfo.ProductName)"
+
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft') {
+            throw "Refusing to execute installer because Microsoft Authenticode verification failed."
+          }
+
+          "INSTALLER_PATH=$installer" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Probe installer UI and optionally attempt official Launcher install
+        shell: pwsh
+        env:
+          ACCEPT_LAUNCHER_EULA: ${{ inputs.accept_launcher_eula }}
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          function Get-LauncherPackage {
+            Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
+              Where-Object { $_.PackageFamilyName -eq $env:LAUNCHER_PFN } |
+              Select-Object -First 1
+          }
+
+          function Stop-MinecraftInstaller {
+            Get-Process -Name MinecraftInstaller -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+
+          $uiaAvailable = $true
+          try {
+            Add-Type -AssemblyName UIAutomationClient
+            Add-Type -AssemblyName UIAutomationTypes
+          } catch {
+            $uiaAvailable = $false
+            Write-Host "UI_AUTOMATION_AVAILABLE=false"
+            Write-Host "UI_AUTOMATION_ERROR=$($_.Exception.Message)"
+          }
+
+          function Get-InstallerElements([int]$processId) {
+            if (-not $uiaAvailable) { return @() }
+            try {
+              $root = [System.Windows.Automation.AutomationElement]::RootElement
+              $condition = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ProcessIdProperty,
+                $processId
+              )
+              $collection = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+              $items = @()
+              for ($i = 0; $i -lt $collection.Count; $i++) {
+                $el = $collection.Item($i)
+                try {
+                  $items += [pscustomobject]@{
+                    Element = $el
+                    Name = $el.Current.Name
+                    AutomationId = $el.Current.AutomationId
+                    ControlType = $el.Current.ControlType.ProgrammaticName
+                    Enabled = $el.Current.IsEnabled
+                  }
+                } catch {}
+              }
+              return $items
+            } catch {
+              Write-Host "UI_TREE_ERROR=$($_.Exception.Message)"
+              return @()
+            }
+          }
+
+          function Dump-InstallerUI([int]$processId, [string]$label) {
+            Write-Host "=== INSTALLER UI: $label ==="
+            $items = Get-InstallerElements $processId
+            Write-Host "UI_ELEMENT_COUNT=$($items.Count)"
+            $items |
+              Where-Object { $_.Name -or $_.AutomationId } |
+              Select-Object -First 180 |
+              ForEach-Object {
+                $safeName = ($_.Name -replace "`r|`n", ' ')
+                Write-Host "UI CONTROL=$($_.ControlType) ENABLED=$($_.Enabled) ID=[$($_.AutomationId)] NAME=[$safeName]"
+              }
+            return $items
+          }
+
+          $before = Get-LauncherPackage
+          if ($before) {
+            Write-Host "LAUNCHER_ALREADY_INSTALLED=true"
+            Write-Host "LAUNCHER_PACKAGE=$($before.PackageFullName)"
+            exit 0
+          }
+
+          Write-Host "LAUNCHER_ALREADY_INSTALLED=false"
+          Write-Host "ACCEPT_LAUNCHER_EULA=$env:ACCEPT_LAUNCHER_EULA"
+
+          $proc = Start-Process -FilePath $env:INSTALLER_PATH -PassThru
+          Write-Host "INSTALLER_PID=$($proc.Id)"
+          Start-Sleep -Seconds 10
+
+          if ($proc.HasExited) {
+            Write-Host "INSTALLER_EXITED_EARLY=true"
+            Write-Host "INSTALLER_EXIT_CODE=$($proc.ExitCode)"
+          } else {
+            Write-Host "INSTALLER_EXITED_EARLY=false"
+          }
+
+          $items = Dump-InstallerUI $proc.Id "INITIAL"
+
+          if ($env:ACCEPT_LAUNCHER_EULA -ne 'true') {
+            Write-Host "INSTALL_ATTEMPT_SKIPPED=true"
+            Write-Host "REASON=accept_launcher_eula was not explicitly enabled"
+            Stop-MinecraftInstaller
+            exit 0
+          }
+
+          Write-Host "INSTALL_ATTEMPT_SKIPPED=false"
+          Write-Host "EULA_CONSENT_CONFIRMED_BY_WORKFLOW_INPUT=true"
+
+          # Only invoke ordinary visible installer controls. Never click sign-in/login controls.
+          $clicked = New-Object 'System.Collections.Generic.HashSet[string]'
+          $safeButtonNames = @(
+            'Accept', 'I agree', 'Agree', 'Install', 'Get', 'Continue', 'Next', "Let's go", 'Lets go'
+          )
+
+          for ($round = 1; $round -le 8; $round++) {
+            $pkg = Get-LauncherPackage
+            if ($pkg) {
+              Write-Host "LAUNCHER_APPEARED_DURING_UI_FLOW=true"
+              break
+            }
+
+            if ($proc.HasExited) {
+              Write-Host "INSTALLER_EXITED_DURING_UI_FLOW=true"
+              break
+            }
+
+            $items = Get-InstallerElements $proc.Id
+            $visibleNames = @($items | Where-Object { $_.Name } | ForEach-Object { $_.Name })
+            if ($visibleNames -match '(?i)sign in|log in|login') {
+              Write-Host "SIGN_IN_UI_DETECTED=true"
+              Write-Host "NO_SIGN_IN_AUTOMATION=true"
+              break
+            }
+
+            $target = $null
+            foreach ($wanted in $safeButtonNames) {
+              $candidate = $items | Where-Object {
+                $_.ControlType -eq 'ControlType.Button' -and
+                $_.Enabled -eq $true -and
+                $_.Name -eq $wanted -and
+                -not $clicked.Contains($_.Name)
+              } | Select-Object -First 1
+              if ($candidate) {
+                $target = $candidate
+                break
+              }
+            }
+
+            if ($target) {
+              try {
+                $patternObj = $null
+                if ($target.Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$patternObj)) {
+                  Write-Host "UI_INVOKE_ROUND=$round NAME=$($target.Name) ID=$($target.AutomationId)"
+                  ([System.Windows.Automation.InvokePattern]$patternObj).Invoke()
+                  [void]$clicked.Add($target.Name)
+                } else {
+                  Write-Host "UI_BUTTON_HAS_NO_INVOKE_PATTERN=$($target.Name)"
+                }
+              } catch {
+                Write-Host "UI_INVOKE_ERROR=$($_.Exception.Message)"
+              }
+            } else {
+              Write-Host "NO_SAFE_BUTTON_FOUND_ROUND=$round"
+            }
+
+            Start-Sleep -Seconds 8
+          }
+
+          Dump-InstallerUI $proc.Id "AFTER SAFE UI FLOW" | Out-Null
+
+          Write-Host "=== WAIT FOR LAUNCHER PACKAGE ==="
+          $deadline = (Get-Date).AddMinutes(3)
+          $lastState = ''
+          while ((Get-Date) -lt $deadline) {
+            $pkg = Get-LauncherPackage
+            if ($pkg) { break }
+
+            $interesting = Get-Process -ErrorAction SilentlyContinue |
+              Where-Object { $_.ProcessName -match 'Minecraft|Gaming|Xbox|Store|AppInstall|Clip|wsappx' } |
+              Select-Object -ExpandProperty ProcessName -Unique |
+              Sort-Object
+            $state = ($interesting -join ',')
+            if ($state -ne $lastState) {
+              Write-Host "RELEVANT_PROCESSES=$state"
+              $lastState = $state
+            }
+            Start-Sleep -Seconds 10
+          }
+
+          $pkg = Get-LauncherPackage
+          if ($pkg) {
+            Write-Host "LAUNCHER_INSTALLED=true"
+            Write-Host "LAUNCHER_PACKAGE=$($pkg.PackageFullName)"
+            Write-Host "LAUNCHER_INSTALL_LOCATION=$($pkg.InstallLocation)"
+          } else {
+            Write-Host "LAUNCHER_INSTALLED=false"
+            Write-Host "LIKELY_BLOCKER=See installer UI and process output above; no credentials or Store sign-in were automated."
+          }
+
+          Stop-MinecraftInstaller
+
+      - name: Inspect installed Launcher package without copying payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $pkg = Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
+            Where-Object { $_.PackageFamilyName -eq $env:LAUNCHER_PFN } |
+            Select-Object -First 1
+
+          Write-Host "=== LAUNCHER PACKAGE INSPECTION ==="
+          if (-not $pkg) {
+            Write-Host "PACKAGE_INSPECTION_AVAILABLE=false"
+            Write-Host "FINAL_RESULT=Launcher package was not materialized on this runner."
+            exit 0
+          }
+
+          Write-Host "PACKAGE_INSPECTION_AVAILABLE=true"
+          Write-Host "NAME=$($pkg.Name)"
+          Write-Host "PACKAGE_FULL_NAME=$($pkg.PackageFullName)"
+          Write-Host "PACKAGE_FAMILY_NAME=$($pkg.PackageFamilyName)"
+          Write-Host "PUBLISHER=$($pkg.Publisher)"
+          Write-Host "VERSION=$($pkg.Version)"
+          Write-Host "ARCHITECTURE=$($pkg.Architecture)"
+          Write-Host "INSTALL_LOCATION=$($pkg.InstallLocation)"
+          Write-Host "SIGNATURE_KIND=$($pkg.SignatureKind)"
+          Write-Host "STATUS=$($pkg.Status)"
+
+          $manifestPath = Join-Path $pkg.InstallLocation 'AppxManifest.xml'
+          if (Test-Path $manifestPath) {
+            try {
+              [xml]$manifest = Get-Content $manifestPath -Raw
+              Write-Host "=== MANIFEST SUMMARY ==="
+              $identity = $manifest.Package.Identity
+              Write-Host "MANIFEST_IDENTITY_NAME=$($identity.Name)"
+              Write-Host "MANIFEST_PUBLISHER=$($identity.Publisher)"
+              Write-Host "MANIFEST_VERSION=$($identity.Version)"
+              Write-Host "MANIFEST_ARCH=$($identity.ProcessorArchitecture)"
+
+              $manifest.Package.Capabilities.ChildNodes | ForEach-Object {
+                if ($_.Name) { Write-Host "CAPABILITY=$($_.Name)" }
+              }
+
+              $manifest.Package.Applications.Application | ForEach-Object {
+                Write-Host "APP_ID=$($_.Id) EXECUTABLE=$($_.Executable) ENTRYPOINT=$($_.EntryPoint)"
+                $_.Extensions.ChildNodes | ForEach-Object {
+                  if ($_.Category) { Write-Host "EXTENSION_CATEGORY=$($_.Category)" }
+                }
+              }
+            } catch {
+              Write-Host "MANIFEST_PARSE_ERROR=$($_.Exception.Message)"
+            }
+          } else {
+            Write-Host "MANIFEST_FOUND=false"
+          }
+
+          Write-Host "=== EXECUTABLE / LIBRARY INVENTORY ==="
+          $bins = Get-ChildItem $pkg.InstallLocation -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in '.exe','.dll','.winmd','.json','.js' }
+          Write-Host "BINARY_OR_CODE_FILE_COUNT=$($bins.Count)"
+          $bins | Select-Object -First 220 | ForEach-Object {
+            $rel = $_.FullName.Substring($pkg.InstallLocation.Length).TrimStart('\\')
+            Write-Host "FILE=$rel SIZE=$($_.Length)"
+          }
+
+          Write-Host "=== ACQUISITION STRING TARGETS ==="
+          $needles = @(
+            $env:BEDROCK_PRODUCT_ID,
+            'Microsoft.MinecraftUWP',
+            'GamingServices',
+            'Microsoft.GamingServices',
+            'XStore',
+            'StoreContext',
+            'AppInstallManager',
+            'ms-windows-store',
+            'XCCS',
+            'MSIXVC',
+            'PackageManager',
+            'entitlement'
+          )
+
+          $rg = Get-Command rg -ErrorAction SilentlyContinue
+          if ($rg) {
+            Write-Host "SCANNER=ripgrep"
+            foreach ($needle in $needles) {
+              Write-Host "--- NEEDLE=$needle ---"
+              $matches = & $rg.Source -a -l -F --glob '!*.png' --glob '!*.jpg' --glob '!*.jpeg' --glob '!*.webp' --glob '!*.mp4' --glob '!*.ogg' --glob '!*.wav' -- "$needle" $pkg.InstallLocation 2>$null
+              $matches = @($matches | Select-Object -First 80)
+              Write-Host "MATCH_FILE_COUNT=$($matches.Count)"
+              foreach ($m in $matches) {
+                try {
+                  $rel = [System.IO.Path]::GetFullPath($m).Substring($pkg.InstallLocation.Length).TrimStart('\\')
+                } catch { $rel = $m }
+                Write-Host "MATCH_FILE=$rel"
+              }
+            }
+          } else {
+            Write-Host "SCANNER=ripgrep-unavailable"
+            Write-Host "STRING_SCAN_SKIPPED=true"
+          }
+
+          Write-Host "=== FINAL ==="
+          Write-Host "FINAL_RESULT=Official Minecraft Launcher package materialized and was inspected in place; no package payload was uploaded."
