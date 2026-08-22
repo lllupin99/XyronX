@@ -1,0 +1,91 @@
+name: Test Minecraft Microsoft Store acquisition
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-minecraft-store:
+    runs-on: windows-11-arm
+
+    steps:
+      - name: System info
+        shell: pwsh
+        run: |
+          Write-Host "OS:"
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture
+
+      - name: Make sure WinGet exists
+        shell: pwsh
+        run: |
+          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+            Write-Host "WinGet missing - bootstrapping official Microsoft WinGet client..."
+
+            Install-PackageProvider -Name NuGet -Force | Out-Null
+            Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+            Install-Module -Name Microsoft.WinGet.Client -Force -Repository PSGallery | Out-Null
+            Repair-WinGetPackageManager -AllUsers
+          }
+
+          winget --info
+          winget source list
+
+      - name: Check Minecraft in Microsoft Store
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host "=== MICROSOFT STORE CATALOG TEST ==="
+
+          winget show 9NBLGGH2JHXJ `
+            --source msstore `
+            --accept-source-agreements `
+            --disable-interactivity
+
+          Write-Host "Exit code: $LASTEXITCODE"
+
+      - name: Test official Minecraft download
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $out = "$env:RUNNER_TEMP\minecraft-store-test"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          Write-Host "=== MICROSOFT OFFICIAL DOWNLOAD TEST ==="
+
+          winget download `
+            --id 9NBLGGH2JHXJ `
+            --source msstore `
+            --skip-license `
+            --architecture x64 `
+            --platform Windows.Desktop `
+            --download-directory $out `
+            --accept-source-agreements `
+            --accept-package-agreements `
+            --disable-interactivity `
+            --verbose-logs
+
+          $exit = $LASTEXITCODE
+
+          Write-Host ""
+          Write-Host "=== RESULT ==="
+          Write-Host "WinGet exit code: $exit"
+
+          Write-Host ""
+          Write-Host "=== FILES DOWNLOADED ==="
+
+          if (Test-Path $out) {
+            Get-ChildItem $out -Recurse | Select-Object FullName, Length
+          }
+
+          Write-Host ""
+          Write-Host "=== TOTAL SIZE ==="
+
+          if (Test-Path $out) {
+            $size = (
+              Get-ChildItem $out -Recurse -File |
+              Measure-Object Length -Sum
+            ).Sum
+
+            Write-Host "$size bytes"
+          }
+
+          exit 0
