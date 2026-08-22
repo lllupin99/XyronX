@@ -1,0 +1,316 @@
+name: Probe GamingServices package graph activation
+
+on:
+  workflow_dispatch:
+    inputs:
+      accept_launcher_eula:
+        description: "I accept the official Minecraft Launcher EULA and allow one Gaming Services materialization attempt"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  probe-package-graph:
+    runs-on: windows-11-arm
+    timeout-minutes: 8
+    env:
+      INSTALLER_URL: https://aka.ms/minecraftClientGameCoreWindows
+      GAMING_SERVICES_NAME: Microsoft.GamingServices
+
+    steps:
+      - name: Download and verify official installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'MinecraftInstaller.exe'
+          Invoke-WebRequest -Uri $env:INSTALLER_URL -OutFile $installer -MaximumRedirection 10
+          $sig = Get-AuthenticodeSignature $installer
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft') {
+            throw 'Microsoft Authenticode verification failed.'
+          }
+          Write-Host "INSTALLER_SHA256=$((Get-FileHash $installer -Algorithm SHA256).Hash)"
+          Write-Host "SIGNATURE_STATUS=$($sig.Status)"
+          "INSTALLER_PATH=$installer" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Materialize Gaming Services only
+        shell: pwsh
+        env:
+          ACCEPT_LAUNCHER_EULA: ${{ inputs.accept_launcher_eula }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if ($env:ACCEPT_LAUNCHER_EULA -ne 'true') {
+            Write-Host 'INSTALL_ATTEMPT_SKIPPED=true'
+            exit 0
+          }
+
+          Add-Type -AssemblyName UIAutomationClient
+          Add-Type -AssemblyName UIAutomationTypes
+
+          function Get-Elements([int]$processId) {
+            try {
+              $root = [System.Windows.Automation.AutomationElement]::RootElement
+              $condition = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ProcessIdProperty,
+                $processId
+              )
+              $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+              $result = @()
+              for ($i = 0; $i -lt $all.Count; $i++) {
+                $element = $all.Item($i)
+                try {
+                  $result += [pscustomobject]@{
+                    Element = $element
+                    Id = $element.Current.AutomationId
+                    Type = $element.Current.ControlType.ProgrammaticName
+                    Enabled = $element.Current.IsEnabled
+                  }
+                } catch {}
+              }
+              return $result
+            } catch { return @() }
+          }
+
+          Write-Host 'STORE_SIGN_IN_AUTOMATION=false'
+          Write-Host 'EULA_CONSENT_CONFIRMED_BY_WORKFLOW_INPUT=true'
+          $proc = Start-Process -FilePath $env:INSTALLER_PATH -PassThru
+
+          $checkbox = $null
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            Start-Sleep -Seconds 5
+            if ($proc.HasExited) { break }
+            $elements = Get-Elements $proc.Id
+            $checkbox = $elements |
+              Where-Object { $_.Id -eq 'AgreementCheckbox' -and $_.Type -eq 'ControlType.CheckBox' } |
+              Select-Object -First 1
+            Write-Host "UI_WAIT_ATTEMPT=$attempt ELEMENTS=$($elements.Count) CHECKBOX_FOUND=$([bool]$checkbox)"
+            if ($checkbox) { break }
+          }
+          if (-not $checkbox) { Write-Host 'EULA_CHECKBOX_FOUND=false'; exit 0 }
+
+          $pattern = $null
+          if ($checkbox.Element.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
+            $toggle = [System.Windows.Automation.TogglePattern]$pattern
+            if ($toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::Off) { $toggle.Toggle() }
+          }
+          Start-Sleep -Seconds 3
+
+          $elements = Get-Elements $proc.Id
+          $button = $elements |
+            Where-Object { $_.Id -eq 'ContinueButton' -and $_.Type -eq 'ControlType.Button' -and $_.Enabled } |
+            Select-Object -First 1
+          if (-not $button) { Write-Host 'INSTALL_BUTTON_READY=false'; exit 0 }
+
+          $pattern = $null
+          if ($button.Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+            ([System.Windows.Automation.InvokePattern]$pattern).Invoke()
+            Write-Host 'INSTALL_BUTTON_INVOKED=true'
+          }
+
+          $gs = $null
+          $deadline = (Get-Date).AddMinutes(5)
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 10
+            $gs = Get-AppxPackage -Name $env:GAMING_SERVICES_NAME -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($gs) { break }
+            if ($proc.HasExited) { break }
+          }
+          if (-not $gs) { Write-Host 'GAMING_SERVICES_PRESENT=false'; exit 0 }
+
+          Write-Host "GAMING_SERVICES_PRESENT=true PACKAGE=$($gs.PackageFullName)"
+          "GAMING_SERVICES_PFN=$($gs.PackageFamilyName)" | Out-File $env:GITHUB_ENV -Append
+          "GAMING_SERVICES_VERSION=$($gs.Version)" | Out-File $env:GITHUB_ENV -Append
+          Get-Process -Name MinecraftInstaller,GamingRepair -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+
+      - name: Add Gaming Services to package graph and retry activation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if (-not $env:GAMING_SERVICES_PFN) {
+            Write-Host 'PACKAGE_GRAPH_PROBE_AVAILABLE=false'
+            exit 0
+          }
+
+          Write-Host 'PACKAGE_GRAPH_PROBE_AVAILABLE=true'
+          Write-Host 'NO_STORE_METHODS_INVOKED=true'
+          Write-Host 'NO_LICENSE_METHODS_INVOKED=true'
+          Write-Host 'NO_PACKAGE_REQUESTS_SUBMITTED=true'
+
+          $source = @'
+          using System;
+          using System.Runtime.InteropServices;
+
+          public static class PackageGraphProbe
+          {
+              [DllImport("kernelbase.dll", CharSet = CharSet.Unicode)]
+              public static extern int TryCreatePackageDependency(
+                  IntPtr user,
+                  string packageFamilyName,
+                  ulong minVersion,
+                  int processorArchitectures,
+                  int lifetimeKind,
+                  string lifetimeArtifact,
+                  int options,
+                  out IntPtr packageDependencyId);
+
+              [DllImport("kernelbase.dll", CharSet = CharSet.Unicode)]
+              public static extern int AddPackageDependency2(
+                  string packageDependencyId,
+                  int rank,
+                  int options,
+                  out IntPtr packageDependencyContext,
+                  out IntPtr packageFullName);
+
+              [DllImport("kernelbase.dll", CharSet = CharSet.Unicode)]
+              public static extern int RemovePackageDependency(IntPtr packageDependencyContext);
+
+              [DllImport("kernelbase.dll", CharSet = CharSet.Unicode)]
+              public static extern int DeletePackageDependency(string packageDependencyId);
+
+              [DllImport("kernel32.dll")]
+              public static extern IntPtr GetProcessHeap();
+
+              [DllImport("kernel32.dll")]
+              [return: MarshalAs(UnmanagedType.Bool)]
+              public static extern bool HeapFree(IntPtr heap, uint flags, IntPtr memory);
+
+              [DllImport("combase.dll")]
+              private static extern int RoInitialize(uint initType);
+
+              [DllImport("combase.dll")]
+              private static extern void RoUninitialize();
+
+              [DllImport("combase.dll", CharSet = CharSet.Unicode)]
+              private static extern int WindowsCreateString(string sourceString, int length, out IntPtr hstring);
+
+              [DllImport("combase.dll")]
+              private static extern int WindowsDeleteString(IntPtr hstring);
+
+              [DllImport("combase.dll")]
+              private static extern int RoGetActivationFactory(IntPtr activatableClassId, ref Guid iid, out IntPtr factory);
+
+              private static readonly Guid IID_IActivationFactory = new Guid("00000035-0000-0000-C000-000000000046");
+
+              public static int ProbeActivation(string className)
+              {
+                  int init = RoInitialize(1);
+                  IntPtr h = IntPtr.Zero;
+                  IntPtr factory = IntPtr.Zero;
+                  try
+                  {
+                      int hr = WindowsCreateString(className, className.Length, out h);
+                      if (hr < 0) return hr;
+                      Guid iid = IID_IActivationFactory;
+                      return RoGetActivationFactory(h, ref iid, out factory);
+                  }
+                  finally
+                  {
+                      if (factory != IntPtr.Zero) Marshal.Release(factory);
+                      if (h != IntPtr.Zero) WindowsDeleteString(h);
+                      if (init >= 0) RoUninitialize();
+                  }
+              }
+          }
+          '@
+
+          Add-Type -TypeDefinition $source -Language CSharp
+
+          function Hex-HResult([int]$hr) {
+            $bytes = [BitConverter]::GetBytes($hr)
+            return ('0x{0:X8}' -f [BitConverter]::ToUInt32($bytes, 0))
+          }
+
+          $classes = @(
+            'Microsoft.GamePlatform.Services.Store',
+            'Microsoft.GamePlatform.Services.Licensing',
+            'Microsoft.GamePlatform.Services.PackageRequest',
+            'Microsoft.GamePlatform.Services.PackageQueue',
+            'Microsoft.GamePlatform.Services.ContentAccess',
+            'Microsoft.GamePlatform.Services.Identity.XboxAuthManager'
+          )
+
+          Write-Host '=== ACTIVATION BEFORE PACKAGE GRAPH ==='
+          foreach ($class in $classes) {
+            $hr = [PackageGraphProbe]::ProbeActivation($class)
+            Write-Host "BEFORE_CLASS=$class HRESULT=$(Hex-HResult $hr) SUCCESS=$($hr -ge 0)"
+          }
+
+          $parts = $env:GAMING_SERVICES_VERSION.Split('.')
+          [uint64]$minVersion = ([uint64]$parts[0] * 281474976710656) +
+                               ([uint64]$parts[1] * 4294967296) +
+                               ([uint64]$parts[2] * 65536) +
+                               [uint64]$parts[3]
+          Write-Host "TARGET_PFN=$env:GAMING_SERVICES_PFN"
+          Write-Host "TARGET_VERSION=$env:GAMING_SERVICES_VERSION PACKAGE_VERSION_UINT64=$minVersion"
+
+          $dependencyIdPtr = [IntPtr]::Zero
+          $dependencyId = $null
+          $context = [IntPtr]::Zero
+          $resolvedFullNamePtr = [IntPtr]::Zero
+
+          try {
+            $createHr = [PackageGraphProbe]::TryCreatePackageDependency(
+              [IntPtr]::Zero,
+              $env:GAMING_SERVICES_PFN,
+              $minVersion,
+              5,
+              0,
+              $null,
+              0,
+              [ref]$dependencyIdPtr
+            )
+            Write-Host "TRY_CREATE_PACKAGE_DEPENDENCY_HRESULT=$(Hex-HResult $createHr) SUCCESS=$($createHr -ge 0)"
+
+            if ($createHr -ge 0 -and $dependencyIdPtr -ne [IntPtr]::Zero) {
+              $dependencyId = [Runtime.InteropServices.Marshal]::PtrToStringUni($dependencyIdPtr)
+              Write-Host "PACKAGE_DEPENDENCY_ID_CREATED=$([bool]$dependencyId)"
+              [PackageGraphProbe]::HeapFree([PackageGraphProbe]::GetProcessHeap(), 0, $dependencyIdPtr) | Out-Null
+              $dependencyIdPtr = [IntPtr]::Zero
+
+              $addHr = [PackageGraphProbe]::AddPackageDependency2(
+                $dependencyId,
+                0,
+                2,
+                [ref]$context,
+                [ref]$resolvedFullNamePtr
+              )
+              Write-Host "ADD_PACKAGE_DEPENDENCY2_HRESULT=$(Hex-HResult $addHr) SUCCESS=$($addHr -ge 0)"
+
+              if ($resolvedFullNamePtr -ne [IntPtr]::Zero) {
+                $resolved = [Runtime.InteropServices.Marshal]::PtrToStringUni($resolvedFullNamePtr)
+                Write-Host "RESOLVED_PACKAGE_FULL_NAME=$resolved"
+                [PackageGraphProbe]::HeapFree([PackageGraphProbe]::GetProcessHeap(), 0, $resolvedFullNamePtr) | Out-Null
+                $resolvedFullNamePtr = [IntPtr]::Zero
+              }
+
+              if ($addHr -ge 0) {
+                Write-Host '=== ACTIVATION AFTER PACKAGE GRAPH ==='
+                foreach ($class in $classes) {
+                  $hr = [PackageGraphProbe]::ProbeActivation($class)
+                  Write-Host "AFTER_CLASS=$class HRESULT=$(Hex-HResult $hr) SUCCESS=$($hr -ge 0)"
+                }
+              }
+            }
+          } catch {
+            Write-Host "PACKAGE_GRAPH_EXCEPTION=$($_.Exception.GetType().FullName):$($_.Exception.Message)"
+          } finally {
+            if ($context -ne [IntPtr]::Zero) {
+              $removeHr = [PackageGraphProbe]::RemovePackageDependency($context)
+              Write-Host "REMOVE_PACKAGE_DEPENDENCY_HRESULT=$(Hex-HResult $removeHr) SUCCESS=$($removeHr -ge 0)"
+            }
+            if ($dependencyId) {
+              $deleteHr = [PackageGraphProbe]::DeletePackageDependency($dependencyId)
+              Write-Host "DELETE_PACKAGE_DEPENDENCY_HRESULT=$(Hex-HResult $deleteHr) SUCCESS=$($deleteHr -ge 0)"
+            }
+            if ($dependencyIdPtr -ne [IntPtr]::Zero) {
+              [PackageGraphProbe]::HeapFree([PackageGraphProbe]::GetProcessHeap(), 0, $dependencyIdPtr) | Out-Null
+            }
+            if ($resolvedFullNamePtr -ne [IntPtr]::Zero) {
+              [PackageGraphProbe]::HeapFree([PackageGraphProbe]::GetProcessHeap(), 0, $resolvedFullNamePtr) | Out-Null
+            }
+          }
+
+          Write-Host 'FINAL_RESULT=Package-graph activation probe completed. No Store acquisition, license refresh, entitlement mutation, or package submission method was invoked.'
