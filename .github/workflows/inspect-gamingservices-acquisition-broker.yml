@@ -123,7 +123,6 @@ jobs:
           "GAMING_SERVICES_INSTALL_LOCATION=$($gs.InstallLocation)" | Out-File $env:GITHUB_ENV -Append
           "GAMING_SERVICES_PACKAGE_FULL_NAME=$($gs.PackageFullName)" | Out-File $env:GITHUB_ENV -Append
 
-          # We only need the materialized Gaming Services package for static inspection.
           Get-Process -Name MinecraftInstaller,GamingRepair -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           Write-Host 'OFFICIAL_INSTALL_FLOW_STOPPED_AFTER_GAMING_SERVICES_MATERIALIZED=true'
 
@@ -172,7 +171,6 @@ jobs:
             Select-Object ProcessId,ParentProcessId,Name,ExecutablePath |
             Format-Table -AutoSize
 
-          # Scan both ASCII and UTF-16LE so WinRT / COM / product-id strings are not missed.
           Write-Host '=== ACQUISITION STRING TARGETS ==='
           $needles=@(
             $env:BEDROCK_PRODUCT_ID,
@@ -244,4 +242,4 @@ jobs:
             Write-Host 'DUMPBIN_AVAILABLE=false'
           }
 
-          Write-Host 'FINAL_RESULT=Gaming Services was materialized by Microsoft\'s signed installer and statically inspected in place. No Microsoft sign-in was automated, no tokens were collected, no Store capability was forged, and no package payload was uploaded.'
+          Write-Host "FINAL_RESULT=Gaming Services was materialized by Microsoft's signed installer and statically inspected in place. No Microsoft sign-in was automated, no tokens were collected, no Store capability was forged, and no package payload was uploaded."
