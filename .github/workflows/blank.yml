@@ -72,15 +72,15 @@ jobs:
 
           Write-Host ""
           Write-Host "=== UPDATE SOURCES ==="
+
           winget source update `
-            --accept-source-agreements `
             --disable-interactivity
 
       - name: Verify Microsoft Store source works
         shell: pwsh
         run: |
           Write-Host "=== BASELINE MICROSOFT STORE SEARCH ==="
-          Write-Host "Searching for Windows Terminal."
+          Write-Host "Searching for Windows Terminal..."
 
           winget search "Windows Terminal" `
             --source msstore `
@@ -95,7 +95,6 @@ jobs:
           if ($exit -ne 0) {
             Write-Host ""
             Write-Host "BASELINE_MSSTORE_TEST=FAIL"
-            Write-Host "The runner cannot reliably query msstore."
             exit 1
           }
 
@@ -130,7 +129,7 @@ jobs:
 
           Write-Host ""
           Write-Host "================================="
-          Write-Host "SEARCH 3: Microsoft Store ID"
+          Write-Host "SEARCH 3: STORE ID"
           Write-Host "9NBLGGH2JHXJ"
           Write-Host "================================="
 
@@ -141,8 +140,6 @@ jobs:
 
           Write-Host "Exit code: $LASTEXITCODE"
 
-          # Do not fail the workflow if Minecraft simply is not exposed
-          # by the Microsoft Store WinGet catalog.
           exit 0
 
       - name: Show Minecraft package details
@@ -173,7 +170,7 @@ jobs:
 
           exit 0
 
-      - name: Test official Minecraft download by Store ID
+      - name: Test official Minecraft download
         shell: pwsh
         run: |
           $out = Join-Path `
@@ -205,10 +202,6 @@ jobs:
           $exit = $LASTEXITCODE
 
           Write-Host ""
-          Write-Host "================================="
-          Write-Host "RESULT"
-          Write-Host "================================="
-
           Write-Host "WinGet exit code: $exit"
 
           Write-Host ""
@@ -238,34 +231,14 @@ jobs:
           }
           else {
             Write-Host "No files downloaded."
-
-            Write-Host ""
             Write-Host "MICROSOFT_MINECRAFT_DOWNLOAD=NO_FILES"
           }
 
-          # We want the diagnostic output even when Microsoft refuses
-          # or does not expose the package.
           exit 0
 
-      - name: Final result summary
+      - name: Final result
         shell: pwsh
         run: |
           Write-Host "================================="
-          Write-Host "TEST COMPLETE"
+          Write-Host "MICROSOFT STORE TEST COMPLETE"
           Write-Host "================================="
-
-          Write-Host ""
-          Write-Host "Interpret the previous steps:"
-          Write-Host ""
-          Write-Host "1. If the baseline Store search failed:"
-          Write-Host "   the GitHub runner/msstore environment is the problem."
-          Write-Host ""
-          Write-Host "2. If baseline passed but every Minecraft search returned:"
-          Write-Host "   'No package found matching input criteria'"
-          Write-Host "   then Minecraft is not being exposed by this msstore catalog path."
-          Write-Host ""
-          Write-Host "3. If Minecraft appears but download asks for authentication:"
-          Write-Host "   Microsoft exposes the package, but acquisition has an auth requirement."
-          Write-Host ""
-          Write-Host "4. If files downloaded:"
-          Write-Host "   inspect the result before drawing conclusions about licensing or usability."
