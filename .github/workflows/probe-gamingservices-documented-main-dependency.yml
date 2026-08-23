@@ -15,7 +15,7 @@ permissions:
 jobs:
   probe-documented-main-dependency:
     runs-on: windows-11-arm
-    timeout-minutes: 12
+    timeout-minutes: 15
     env:
       INSTALLER_URL: https://aka.ms/minecraftClientGameCoreWindows
       GAMING_SERVICES_NAME: Microsoft.GamingServices
@@ -35,7 +35,7 @@ jobs:
           Write-Host "SIGNATURE_STATUS=$($sig.Status)"
           "INSTALLER_PATH=$installer" | Out-File $env:GITHUB_ENV -Append
 
-      - name: Materialize Gaming Services only
+      - name: Materialize Gaming Services and wait until ready
         shell: pwsh
         env:
           ACCEPT_LAUNCHER_EULA: ${{ inputs.accept_launcher_eula }}
@@ -110,18 +110,39 @@ jobs:
           }
 
           $gs = $null
-          $deadline = (Get-Date).AddMinutes(5)
+          $status = $null
+          $deadline = (Get-Date).AddMinutes(7)
+          $poll = 0
           while ((Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 10
+            $poll++
             $gs = Get-AppxPackage -Name $env:GAMING_SERVICES_NAME -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($gs) { break }
-            if ($proc.HasExited) { break }
+            if (-not $gs) {
+              Write-Host "GAMING_SERVICES_READY_POLL=$poll PRESENT=false"
+              continue
+            }
+
+            $status = $gs.Status.ToString()
+            Write-Host "GAMING_SERVICES_READY_POLL=$poll PRESENT=true STATUS=$status PACKAGE=$($gs.PackageFullName)"
+            if ($status -eq 'Ok') { break }
           }
-          if (-not $gs) { Write-Host 'GAMING_SERVICES_PRESENT=false'; exit 0 }
+
+          if (-not $gs) {
+            Write-Host 'GAMING_SERVICES_PRESENT=false'
+            exit 0
+          }
 
           Write-Host "GAMING_SERVICES_PRESENT=true PACKAGE=$($gs.PackageFullName)"
           Write-Host "GAMING_SERVICES_PFN=$($gs.PackageFamilyName)"
-          Write-Host "GAMING_SERVICES_STATUS=$($gs.Status)"
+          Write-Host "GAMING_SERVICES_STATUS=$status"
+
+          if ($status -ne 'Ok') {
+            Write-Host 'GAMING_SERVICES_READY=false'
+            Write-Host 'DEPENDENCY_PROBE_SKIPPED_NOT_READY=true'
+            exit 0
+          }
+
+          Write-Host 'GAMING_SERVICES_READY=true'
           "GAMING_SERVICES_PFN=$($gs.PackageFamilyName)" | Out-File $env:GITHUB_ENV -Append
 
           Get-Process -Name MinecraftInstaller,GamingRepair -ErrorAction SilentlyContinue |
