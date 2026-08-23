@@ -1,0 +1,354 @@
+name: Probe GamingServices native dependency2
+
+on:
+  workflow_dispatch:
+    inputs:
+      accept_launcher_eula:
+        description: "I accept the official Minecraft Launcher EULA and allow one Gaming Services materialization attempt"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  probe-native-dependency2:
+    runs-on: windows-11-arm
+    timeout-minutes: 12
+    env:
+      INSTALLER_URL: https://aka.ms/minecraftClientGameCoreWindows
+      GAMING_SERVICES_NAME: Microsoft.GamingServices
+
+    steps:
+      - name: Download and verify official installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'MinecraftInstaller.exe'
+          Invoke-WebRequest -Uri $env:INSTALLER_URL -OutFile $installer -MaximumRedirection 10
+          $sig = Get-AuthenticodeSignature $installer
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft') {
+            throw 'Microsoft Authenticode verification failed.'
+          }
+          Write-Host "INSTALLER_SHA256=$((Get-FileHash $installer -Algorithm SHA256).Hash)"
+          Write-Host "SIGNATURE_STATUS=$($sig.Status)"
+          "INSTALLER_PATH=$installer" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Materialize Gaming Services only
+        shell: pwsh
+        env:
+          ACCEPT_LAUNCHER_EULA: ${{ inputs.accept_launcher_eula }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if ($env:ACCEPT_LAUNCHER_EULA -ne 'true') {
+            Write-Host 'INSTALL_ATTEMPT_SKIPPED=true'
+            exit 0
+          }
+
+          Add-Type -AssemblyName UIAutomationClient
+          Add-Type -AssemblyName UIAutomationTypes
+
+          function Get-Elements([int]$processId) {
+            try {
+              $root = [System.Windows.Automation.AutomationElement]::RootElement
+              $condition = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ProcessIdProperty,
+                $processId
+              )
+              $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+              $result = @()
+              for ($i = 0; $i -lt $all.Count; $i++) {
+                $element = $all.Item($i)
+                try {
+                  $result += [pscustomobject]@{
+                    Element = $element
+                    Id = $element.Current.AutomationId
+                    Type = $element.Current.ControlType.ProgrammaticName
+                    Enabled = $element.Current.IsEnabled
+                  }
+                } catch {}
+              }
+              return $result
+            } catch { return @() }
+          }
+
+          Write-Host 'STORE_SIGN_IN_AUTOMATION=false'
+          Write-Host 'EULA_CONSENT_CONFIRMED_BY_WORKFLOW_INPUT=true'
+          $proc = Start-Process -FilePath $env:INSTALLER_PATH -PassThru
+
+          $checkbox = $null
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            Start-Sleep -Seconds 5
+            if ($proc.HasExited) { break }
+            $elements = Get-Elements $proc.Id
+            $checkbox = $elements |
+              Where-Object { $_.Id -eq 'AgreementCheckbox' -and $_.Type -eq 'ControlType.CheckBox' } |
+              Select-Object -First 1
+            Write-Host "UI_WAIT_ATTEMPT=$attempt ELEMENTS=$($elements.Count) CHECKBOX_FOUND=$([bool]$checkbox)"
+            if ($checkbox) { break }
+          }
+          if (-not $checkbox) { Write-Host 'EULA_CHECKBOX_FOUND=false'; exit 0 }
+
+          $pattern = $null
+          if ($checkbox.Element.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
+            $toggle = [System.Windows.Automation.TogglePattern]$pattern
+            if ($toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::Off) { $toggle.Toggle() }
+          }
+          Start-Sleep -Seconds 3
+
+          $elements = Get-Elements $proc.Id
+          $button = $elements |
+            Where-Object { $_.Id -eq 'ContinueButton' -and $_.Type -eq 'ControlType.Button' -and $_.Enabled } |
+            Select-Object -First 1
+          if (-not $button) { Write-Host 'INSTALL_BUTTON_READY=false'; exit 0 }
+
+          $pattern = $null
+          if ($button.Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+            ([System.Windows.Automation.InvokePattern]$pattern).Invoke()
+            Write-Host 'INSTALL_BUTTON_INVOKED=true'
+          }
+
+          $gs = $null
+          $deadline = (Get-Date).AddMinutes(5)
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 10
+            $gs = Get-AppxPackage -Name $env:GAMING_SERVICES_NAME -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($gs) { break }
+            if ($proc.HasExited) { break }
+          }
+          if (-not $gs) { Write-Host 'GAMING_SERVICES_PRESENT=false'; exit 0 }
+
+          Write-Host "GAMING_SERVICES_PRESENT=true PACKAGE=$($gs.PackageFullName)"
+          Write-Host "GAMING_SERVICES_PFN=$($gs.PackageFamilyName)"
+          Write-Host "GAMING_SERVICES_STATUS=$($gs.Status)"
+          "GAMING_SERVICES_PFN=$($gs.PackageFamilyName)" | Out-File $env:GITHUB_ENV -Append
+
+          Get-Process -Name MinecraftInstaller,GamingRepair -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+
+      - name: Build native dependency2 probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:GAMING_SERVICES_PFN) { Write-Host 'NATIVE_DEPENDENCY2_PROBE_AVAILABLE=false'; exit 0 }
+
+          $root = Join-Path $env:RUNNER_TEMP 'GamingServicesNativeDependency2Probe'
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+
+          @'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net8.0-windows10.0.26100.0</TargetFramework>
+              <RuntimeIdentifier>win-arm64</RuntimeIdentifier>
+              <PlatformTarget>ARM64</PlatformTarget>
+              <Nullable>enable</Nullable>
+            </PropertyGroup>
+          </Project>
+          '@ | Set-Content -Path (Join-Path $root 'GamingServicesNativeDependency2Probe.csproj') -Encoding UTF8
+
+          @'
+          using System;
+          using System.Runtime.InteropServices;
+
+          internal static class Program
+          {
+              [StructLayout(LayoutKind.Explicit)]
+              private struct PackageVersion
+              {
+                  [FieldOffset(0)] public ulong Version;
+              }
+
+              [DllImport("api-ms-win-appmodel-runtime-l1-1-7.dll", CharSet = CharSet.Unicode)]
+              private static extern int TryCreatePackageDependency2(
+                  IntPtr user,
+                  string packageFamilyName,
+                  PackageVersion minVersion,
+                  int processorArchitectures,
+                  int lifetimeKind,
+                  IntPtr lifetimeArtifact,
+                  int options,
+                  IntPtr lifetimeExpiration,
+                  out IntPtr packageDependencyId);
+
+              [DllImport("api-ms-win-appmodel-runtime-l1-1-7.dll", CharSet = CharSet.Unicode)]
+              private static extern int AddPackageDependency2(
+                  string packageDependencyId,
+                  int rank,
+                  int options,
+                  out IntPtr packageDependencyContext,
+                  out IntPtr packageFullName);
+
+              [DllImport("kernelbase.dll", CharSet = CharSet.Unicode)]
+              private static extern int RemovePackageDependency(IntPtr packageDependencyContext);
+
+              [DllImport("kernelbase.dll", CharSet = CharSet.Unicode)]
+              private static extern int DeletePackageDependency(string packageDependencyId);
+
+              [DllImport("kernel32.dll")]
+              private static extern IntPtr GetProcessHeap();
+
+              [DllImport("kernel32.dll")]
+              [return: MarshalAs(UnmanagedType.Bool)]
+              private static extern bool HeapFree(IntPtr hHeap, uint dwFlags, IntPtr lpMem);
+
+              [DllImport("combase.dll")]
+              private static extern int RoInitialize(uint initType);
+
+              [DllImport("combase.dll")]
+              private static extern void RoUninitialize();
+
+              [DllImport("combase.dll", CharSet = CharSet.Unicode)]
+              private static extern int WindowsCreateString(string sourceString, int length, out IntPtr hstring);
+
+              [DllImport("combase.dll")]
+              private static extern int WindowsDeleteString(IntPtr hstring);
+
+              [DllImport("combase.dll")]
+              private static extern int RoGetActivationFactory(IntPtr activatableClassId, ref Guid iid, out IntPtr factory);
+
+              private static readonly Guid IID_IActivationFactory = new("00000035-0000-0000-C000-000000000046");
+
+              private static string Hex(int hr) => $"0x{unchecked((uint)hr):X8}";
+
+              private static int Probe(string className)
+              {
+                  int init = RoInitialize(1);
+                  IntPtr h = IntPtr.Zero;
+                  IntPtr factory = IntPtr.Zero;
+                  try
+                  {
+                      int hr = WindowsCreateString(className, className.Length, out h);
+                      if (hr < 0) return hr;
+                      Guid iid = IID_IActivationFactory;
+                      return RoGetActivationFactory(h, ref iid, out factory);
+                  }
+                  finally
+                  {
+                      if (factory != IntPtr.Zero) Marshal.Release(factory);
+                      if (h != IntPtr.Zero) WindowsDeleteString(h);
+                      if (init >= 0) RoUninitialize();
+                  }
+              }
+
+              public static int Main(string[] args)
+              {
+                  Console.WriteLine("NO_STORE_METHODS_INVOKED=true");
+                  Console.WriteLine("NO_LICENSE_METHODS_INVOKED=true");
+                  Console.WriteLine("NO_PACKAGE_REQUESTS_SUBMITTED=true");
+                  Console.WriteLine("DEPENDENCY_LIFETIME=Process");
+                  Console.WriteLine("ADD_OPTIONS=SpecifiedPackageFamilyOnly");
+
+                  if (args.Length < 1) { Console.WriteLine("ARGS_VALID=false"); return 0; }
+                  string pfn = args[0];
+
+                  string[] classes = {
+                      "Microsoft.GamePlatform.Services.Store",
+                      "Microsoft.GamePlatform.Services.Licensing",
+                      "Microsoft.GamePlatform.Services.PackageRequest",
+                      "Microsoft.GamePlatform.Services.PackageQueue",
+                      "Microsoft.GamePlatform.Services.ContentAccess",
+                      "Microsoft.GamePlatform.Services.Identity.XboxAuthManager"
+                  };
+
+                  foreach (string c in classes)
+                  {
+                      int hr = Probe(c);
+                      Console.WriteLine($"BEFORE_CLASS={c} HRESULT={Hex(hr)} SUCCESS={hr >= 0}");
+                  }
+
+                  IntPtr dependencyIdPtr = IntPtr.Zero;
+                  IntPtr context = IntPtr.Zero;
+                  IntPtr resolvedFullNamePtr = IntPtr.Zero;
+                  string? dependencyId = null;
+
+                  try
+                  {
+                      var minVersion = new PackageVersion { Version = 0 };
+                      int createHr = TryCreatePackageDependency2(
+                          IntPtr.Zero,
+                          pfn,
+                          minVersion,
+                          0,
+                          0,
+                          IntPtr.Zero,
+                          0,
+                          IntPtr.Zero,
+                          out dependencyIdPtr);
+
+                      Console.WriteLine($"TRY_CREATE_PACKAGE_DEPENDENCY2_HRESULT={Hex(createHr)} SUCCESS={createHr >= 0}");
+                      if (createHr < 0 || dependencyIdPtr == IntPtr.Zero) return 0;
+
+                      dependencyId = Marshal.PtrToStringUni(dependencyIdPtr);
+                      Console.WriteLine($"PACKAGE_DEPENDENCY_ID_PRESENT={!string.IsNullOrEmpty(dependencyId)}");
+                      if (string.IsNullOrEmpty(dependencyId)) return 0;
+
+                      int addHr = AddPackageDependency2(
+                          dependencyId,
+                          0,
+                          2,
+                          out context,
+                          out resolvedFullNamePtr);
+
+                      Console.WriteLine($"ADD_PACKAGE_DEPENDENCY2_HRESULT={Hex(addHr)} SUCCESS={addHr >= 0}");
+                      if (resolvedFullNamePtr != IntPtr.Zero)
+                      {
+                          Console.WriteLine($"RESOLVED_PACKAGE_FULL_NAME={Marshal.PtrToStringUni(resolvedFullNamePtr)}");
+                      }
+
+                      if (addHr >= 0)
+                      {
+                          foreach (string c in classes)
+                          {
+                              int hr = Probe(c);
+                              Console.WriteLine($"AFTER_CLASS={c} HRESULT={Hex(hr)} SUCCESS={hr >= 0}");
+                          }
+                      }
+                  }
+                  catch (Exception ex)
+                  {
+                      Console.WriteLine($"NATIVE_DEPENDENCY2_EXCEPTION={ex.GetType().FullName} HR={Hex(ex.HResult)} MESSAGE={ex.Message.Replace('\r',' ').Replace('\n',' ')}");
+                  }
+                  finally
+                  {
+                      if (context != IntPtr.Zero)
+                      {
+                          int hr = RemovePackageDependency(context);
+                          Console.WriteLine($"REMOVE_PACKAGE_DEPENDENCY_HRESULT={Hex(hr)} SUCCESS={hr >= 0}");
+                      }
+
+                      if (!string.IsNullOrEmpty(dependencyId))
+                      {
+                          int hr = DeletePackageDependency(dependencyId);
+                          Console.WriteLine($"DELETE_PACKAGE_DEPENDENCY_HRESULT={Hex(hr)} SUCCESS={hr >= 0}");
+                      }
+
+                      IntPtr heap = GetProcessHeap();
+                      if (resolvedFullNamePtr != IntPtr.Zero) HeapFree(heap, 0, resolvedFullNamePtr);
+                      if (dependencyIdPtr != IntPtr.Zero) HeapFree(heap, 0, dependencyIdPtr);
+                  }
+
+                  Console.WriteLine("FINAL_RESULT=Native dependency2 activation probe completed without invoking Gaming Services Store, licensing, entitlement, or package-submission methods.");
+                  return 0;
+              }
+          }
+          '@ | Set-Content -Path (Join-Path $root 'Program.cs') -Encoding UTF8
+
+          Push-Location $root
+          dotnet restore
+          dotnet publish -c Release -r win-arm64 --self-contained false --no-restore
+          Pop-Location
+
+          $publish = Join-Path $root 'bin\Release\net8.0-windows10.0.26100.0\win-arm64\publish'
+          "NATIVE_PROBE_PUBLISH_DIR=$publish" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Run native dependency2 activation probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if (-not $env:NATIVE_PROBE_PUBLISH_DIR) { Write-Host 'NATIVE_DEPENDENCY2_PROBE_AVAILABLE=false'; exit 0 }
+          $exe = Join-Path $env:NATIVE_PROBE_PUBLISH_DIR 'GamingServicesNativeDependency2Probe.exe'
+          Write-Host "NATIVE_DEPENDENCY2_PROBE_EXE_PRESENT=$(Test-Path $exe)"
+          if (-not (Test-Path $exe)) { exit 0 }
+          & $exe $env:GAMING_SERVICES_PFN
