@@ -1,0 +1,214 @@
+name: Compare GamingServices main dependency criteria
+
+on:
+  workflow_dispatch:
+    inputs:
+      accept_launcher_eula:
+        description: "I accept the official Minecraft Launcher EULA and allow one Gaming Services materialization attempt"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  compare-main-dependency-criteria:
+    runs-on: windows-11-arm
+    timeout-minutes: 15
+    env:
+      INSTALLER_URL: https://aka.ms/minecraftClientGameCoreWindows
+      GAMING_SERVICES_NAME: Microsoft.GamingServices
+
+    steps:
+      - name: Download and verify official installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'MinecraftInstaller.exe'
+          Invoke-WebRequest -Uri $env:INSTALLER_URL -OutFile $installer -MaximumRedirection 10
+          $sig = Get-AuthenticodeSignature $installer
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft') { throw 'Microsoft Authenticode verification failed.' }
+          Write-Host "INSTALLER_SHA256=$((Get-FileHash $installer -Algorithm SHA256).Hash)"
+          Write-Host "SIGNATURE_STATUS=$($sig.Status)"
+          "INSTALLER_PATH=$installer" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Materialize Gaming Services and wait until ready
+        shell: pwsh
+        env:
+          ACCEPT_LAUNCHER_EULA: ${{ inputs.accept_launcher_eula }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if ($env:ACCEPT_LAUNCHER_EULA -ne 'true') { Write-Host 'INSTALL_ATTEMPT_SKIPPED=true'; exit 0 }
+
+          Add-Type -AssemblyName UIAutomationClient
+          Add-Type -AssemblyName UIAutomationTypes
+          function Get-Elements([int]$processId) {
+            try {
+              $root = [System.Windows.Automation.AutomationElement]::RootElement
+              $condition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ProcessIdProperty,$processId)
+              $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$condition)
+              $result = @()
+              for ($i = 0; $i -lt $all.Count; $i++) {
+                $element = $all.Item($i)
+                try { $result += [pscustomobject]@{ Element=$element; Id=$element.Current.AutomationId; Type=$element.Current.ControlType.ProgrammaticName; Enabled=$element.Current.IsEnabled } } catch {}
+              }
+              return $result
+            } catch { return @() }
+          }
+
+          Write-Host 'STORE_SIGN_IN_AUTOMATION=false'
+          Write-Host 'EULA_CONSENT_CONFIRMED_BY_WORKFLOW_INPUT=true'
+          $proc = Start-Process -FilePath $env:INSTALLER_PATH -PassThru
+          $checkbox = $null
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            Start-Sleep -Seconds 5
+            if ($proc.HasExited) { break }
+            $elements = Get-Elements $proc.Id
+            $checkbox = $elements | Where-Object { $_.Id -eq 'AgreementCheckbox' -and $_.Type -eq 'ControlType.CheckBox' } | Select-Object -First 1
+            Write-Host "UI_WAIT_ATTEMPT=$attempt ELEMENTS=$($elements.Count) CHECKBOX_FOUND=$([bool]$checkbox)"
+            if ($checkbox) { break }
+          }
+          if (-not $checkbox) { Write-Host 'EULA_CHECKBOX_FOUND=false'; exit 0 }
+
+          $pattern = $null
+          if ($checkbox.Element.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern,[ref]$pattern)) {
+            $toggle = [System.Windows.Automation.TogglePattern]$pattern
+            if ($toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::Off) { $toggle.Toggle() }
+          }
+          Start-Sleep -Seconds 3
+          $elements = Get-Elements $proc.Id
+          $button = $elements | Where-Object { $_.Id -eq 'ContinueButton' -and $_.Type -eq 'ControlType.Button' -and $_.Enabled } | Select-Object -First 1
+          if (-not $button) { Write-Host 'INSTALL_BUTTON_READY=false'; exit 0 }
+          $pattern = $null
+          if ($button.Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$pattern)) { ([System.Windows.Automation.InvokePattern]$pattern).Invoke(); Write-Host 'INSTALL_BUTTON_INVOKED=true' }
+
+          $gs = $null; $status = $null; $poll = 0; $deadline = (Get-Date).AddMinutes(7)
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 10; $poll++
+            $gs = Get-AppxPackage -Name $env:GAMING_SERVICES_NAME -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $gs) { Write-Host "GAMING_SERVICES_READY_POLL=$poll PRESENT=false"; continue }
+            $status = $gs.Status.ToString()
+            Write-Host "GAMING_SERVICES_READY_POLL=$poll PRESENT=true STATUS=$status PACKAGE=$($gs.PackageFullName)"
+            if ($status -eq 'Ok') { break }
+          }
+          if (-not $gs) { Write-Host 'GAMING_SERVICES_PRESENT=false'; exit 0 }
+          Write-Host "GAMING_SERVICES_PRESENT=true PACKAGE=$($gs.PackageFullName)"
+          Write-Host "GAMING_SERVICES_PFN=$($gs.PackageFamilyName)"
+          Write-Host "GAMING_SERVICES_STATUS=$status"
+          Write-Host "GAMING_SERVICES_ARCH=$($gs.Architecture)"
+          if ($status -ne 'Ok') { Write-Host 'GAMING_SERVICES_READY=false'; exit 0 }
+          Write-Host 'GAMING_SERVICES_READY=true'
+          "GAMING_SERVICES_PFN=$($gs.PackageFamilyName)" | Out-File $env:GITHUB_ENV -Append
+          Get-Process -Name MinecraftInstaller,GamingRepair -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+      - name: Build criteria comparison probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:GAMING_SERVICES_PFN) { Write-Host 'CRITERIA_PROBE_AVAILABLE=false'; exit 0 }
+          $root = Join-Path $env:RUNNER_TEMP 'GamingServicesCriteriaProbe'
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          @'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net8.0-windows10.0.26100.0</TargetFramework>
+              <RuntimeIdentifier>win-arm64</RuntimeIdentifier>
+              <PlatformTarget>ARM64</PlatformTarget>
+              <Nullable>enable</Nullable>
+            </PropertyGroup>
+          </Project>
+          '@ | Set-Content (Join-Path $root 'GamingServicesCriteriaProbe.csproj') -Encoding UTF8
+
+          @'
+          using System;
+          using System.Runtime.InteropServices;
+
+          internal static class Program
+          {
+              [StructLayout(LayoutKind.Explicit)] private struct PackageVersion { [FieldOffset(0)] public ulong Version; }
+              [DllImport("api-ms-win-appmodel-runtime-l1-1-7.dll", CharSet=CharSet.Unicode)]
+              static extern int TryCreatePackageDependency(IntPtr user,string pfn,PackageVersion minVersion,int arch,int lifetimeKind,IntPtr artifact,int options,out IntPtr id);
+              [DllImport("api-ms-win-appmodel-runtime-l1-1-7.dll", CharSet=CharSet.Unicode)]
+              static extern int TryCreatePackageDependency2(IntPtr user,string pfn,PackageVersion minVersion,int arch,int lifetimeKind,IntPtr artifact,int options,IntPtr expiration,out IntPtr id);
+              [DllImport("api-ms-win-appmodel-runtime-l1-1-7.dll", CharSet=CharSet.Unicode)]
+              static extern int AddPackageDependency2(string id,int rank,int options,out IntPtr context,out IntPtr fullName);
+              [DllImport("kernelbase.dll", CharSet=CharSet.Unicode)] static extern int RemovePackageDependency(IntPtr context);
+              [DllImport("kernelbase.dll", CharSet=CharSet.Unicode)] static extern int DeletePackageDependency(string id);
+              [DllImport("kernel32.dll")] static extern IntPtr GetProcessHeap();
+              [DllImport("kernel32.dll")][return:MarshalAs(UnmanagedType.Bool)] static extern bool HeapFree(IntPtr heap,uint flags,IntPtr ptr);
+              [DllImport("combase.dll")] static extern int RoInitialize(uint initType);
+              [DllImport("combase.dll")] static extern void RoUninitialize();
+              [DllImport("combase.dll",CharSet=CharSet.Unicode)] static extern int WindowsCreateString(string s,int len,out IntPtr h);
+              [DllImport("combase.dll")] static extern int WindowsDeleteString(IntPtr h);
+              [DllImport("combase.dll")] static extern int RoGetActivationFactory(IntPtr h,ref Guid iid,out IntPtr factory);
+              static readonly Guid IActivationFactory = new("00000035-0000-0000-C000-000000000046");
+              static string Hex(int hr)=>$"0x{unchecked((uint)hr):X8}";
+
+              static int Activate(string cls) {
+                  int init=RoInitialize(1); IntPtr h=IntPtr.Zero,f=IntPtr.Zero;
+                  try { int hr=WindowsCreateString(cls,cls.Length,out h); if(hr<0)return hr; var iid=IActivationFactory; return RoGetActivationFactory(h,ref iid,out f); }
+                  finally { if(f!=IntPtr.Zero)Marshal.Release(f); if(h!=IntPtr.Zero)WindowsDeleteString(h); if(init>=0)RoUninitialize(); }
+              }
+
+              static void RunVariant(string label,string pfn,bool v2,int arch) {
+                  IntPtr idPtr=IntPtr.Zero,ctx=IntPtr.Zero,namePtr=IntPtr.Zero; string? id=null;
+                  try {
+                      var ver=new PackageVersion{Version=0};
+                      int create=v2 ? TryCreatePackageDependency2(IntPtr.Zero,pfn,ver,arch,0,IntPtr.Zero,1,IntPtr.Zero,out idPtr)
+                                    : TryCreatePackageDependency(IntPtr.Zero,pfn,ver,arch,0,IntPtr.Zero,1,out idPtr);
+                      Console.WriteLine($"VARIANT={label} CREATE_HRESULT={Hex(create)} CREATE_SUCCESS={create>=0}");
+                      if(create<0||idPtr==IntPtr.Zero)return;
+                      id=Marshal.PtrToStringUni(idPtr);
+                      Console.WriteLine($"VARIANT={label} ID_PRESENT={!string.IsNullOrEmpty(id)}");
+                      if(string.IsNullOrEmpty(id))return;
+                      int add=AddPackageDependency2(id,0,2,out ctx,out namePtr);
+                      Console.WriteLine($"VARIANT={label} ADD_HRESULT={Hex(add)} ADD_SUCCESS={add>=0}");
+                      if(namePtr!=IntPtr.Zero)Console.WriteLine($"VARIANT={label} RESOLVED_FULLNAME={Marshal.PtrToStringUni(namePtr)}");
+                      if(add>=0) {
+                          foreach(var cls in new[]{"Microsoft.GamePlatform.Services.Store","Microsoft.GamePlatform.Services.PackageRequest","Microsoft.GamePlatform.Services.PackageQueue"}) {
+                              int hr=Activate(cls); Console.WriteLine($"VARIANT={label} AFTER_CLASS={cls} HRESULT={Hex(hr)} SUCCESS={hr>=0}");
+                          }
+                      }
+                  } finally {
+                      if(ctx!=IntPtr.Zero)Console.WriteLine($"VARIANT={label} REMOVE_HRESULT={Hex(RemovePackageDependency(ctx))}");
+                      if(!string.IsNullOrEmpty(id))Console.WriteLine($"VARIANT={label} DELETE_HRESULT={Hex(DeletePackageDependency(id))}");
+                      var heap=GetProcessHeap(); if(namePtr!=IntPtr.Zero)HeapFree(heap,0,namePtr); if(idPtr!=IntPtr.Zero)HeapFree(heap,0,idPtr);
+                  }
+              }
+
+              public static int Main(string[] args) {
+                  Console.WriteLine("NO_STORE_METHODS_INVOKED=true");
+                  Console.WriteLine("NO_LICENSE_METHODS_INVOKED=true");
+                  Console.WriteLine("NO_PACKAGE_REQUESTS_SUBMITTED=true");
+                  Console.WriteLine("CREATE_OPTIONS=DoNotVerifyDependencyResolution");
+                  Console.WriteLine("ADD_OPTIONS=SpecifiedPackageFamilyOnly");
+                  if(args.Length<1){Console.WriteLine("ARGS_VALID=false");return 0;}
+                  string pfn=args[0];
+                  Console.WriteLine($"BASELINE_STORE_ACTIVATION_HRESULT={Hex(Activate("Microsoft.GamePlatform.Services.Store"))}");
+                  RunVariant("V1_NONE",pfn,false,0);
+                  RunVariant("V1_ARM64",pfn,false,16);
+                  RunVariant("V2_NONE",pfn,true,0);
+                  RunVariant("V2_ARM64",pfn,true,16);
+                  Console.WriteLine("FINAL_RESULT=Dependency criteria comparison completed without invoking Store, licensing, entitlement, or package-submission methods.");
+                  return 0;
+              }
+          }
+          '@ | Set-Content (Join-Path $root 'Program.cs') -Encoding UTF8
+          Push-Location $root
+          dotnet restore
+          dotnet publish -c Release -r win-arm64 --self-contained false --no-restore
+          Pop-Location
+          $publish = Join-Path $root 'bin\Release\net8.0-windows10.0.26100.0\win-arm64\publish'
+          "CRITERIA_PROBE_DIR=$publish" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Run criteria comparison probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if (-not $env:CRITERIA_PROBE_DIR) { Write-Host 'CRITERIA_PROBE_AVAILABLE=false'; exit 0 }
+          $exe = Join-Path $env:CRITERIA_PROBE_DIR 'GamingServicesCriteriaProbe.exe'
+          Write-Host "CRITERIA_PROBE_EXE_PRESENT=$(Test-Path $exe)"
+          if (-not (Test-Path $exe)) { exit 0 }
+          & $exe $env:GAMING_SERVICES_PFN
