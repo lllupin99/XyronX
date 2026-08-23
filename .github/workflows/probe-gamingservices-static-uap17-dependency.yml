@@ -1,0 +1,407 @@
+name: Probe GamingServices static uap17 dependency
+
+on:
+  workflow_dispatch:
+    inputs:
+      accept_launcher_eula:
+        description: "I accept the official Minecraft Launcher EULA and allow one Gaming Services materialization attempt"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  probe-static-uap17-dependency:
+    runs-on: windows-11-arm
+    timeout-minutes: 15
+    env:
+      INSTALLER_URL: https://aka.ms/minecraftClientGameCoreWindows
+      GAMING_SERVICES_NAME: Microsoft.GamingServices
+      PROBE_PACKAGE_NAME: XyronX.GamingServicesProbe
+      PROBE_PUBLISHER: CN=XyronX Test
+
+    steps:
+      - name: Download and verify official installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'MinecraftInstaller.exe'
+          Invoke-WebRequest -Uri $env:INSTALLER_URL -OutFile $installer -MaximumRedirection 10
+          $sig = Get-AuthenticodeSignature $installer
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft') {
+            throw 'Microsoft Authenticode verification failed.'
+          }
+          Write-Host "INSTALLER_SHA256=$((Get-FileHash $installer -Algorithm SHA256).Hash)"
+          Write-Host "SIGNATURE_STATUS=$($sig.Status)"
+          "INSTALLER_PATH=$installer" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Materialize Gaming Services and wait until ready
+        shell: pwsh
+        env:
+          ACCEPT_LAUNCHER_EULA: ${{ inputs.accept_launcher_eula }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if ($env:ACCEPT_LAUNCHER_EULA -ne 'true') {
+            Write-Host 'INSTALL_ATTEMPT_SKIPPED=true'
+            exit 0
+          }
+
+          Add-Type -AssemblyName UIAutomationClient
+          Add-Type -AssemblyName UIAutomationTypes
+
+          function Get-Elements([int]$processId) {
+            try {
+              $root = [System.Windows.Automation.AutomationElement]::RootElement
+              $condition = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ProcessIdProperty,
+                $processId
+              )
+              $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+              $result = @()
+              for ($i = 0; $i -lt $all.Count; $i++) {
+                $element = $all.Item($i)
+                try {
+                  $result += [pscustomobject]@{
+                    Element = $element
+                    Id = $element.Current.AutomationId
+                    Type = $element.Current.ControlType.ProgrammaticName
+                    Enabled = $element.Current.IsEnabled
+                  }
+                } catch {}
+              }
+              return $result
+            } catch { return @() }
+          }
+
+          Write-Host 'STORE_SIGN_IN_AUTOMATION=false'
+          Write-Host 'EULA_CONSENT_CONFIRMED_BY_WORKFLOW_INPUT=true'
+          $proc = Start-Process -FilePath $env:INSTALLER_PATH -PassThru
+
+          $checkbox = $null
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            Start-Sleep -Seconds 5
+            if ($proc.HasExited) { break }
+            $elements = Get-Elements $proc.Id
+            $checkbox = $elements |
+              Where-Object { $_.Id -eq 'AgreementCheckbox' -and $_.Type -eq 'ControlType.CheckBox' } |
+              Select-Object -First 1
+            Write-Host "UI_WAIT_ATTEMPT=$attempt ELEMENTS=$($elements.Count) CHECKBOX_FOUND=$([bool]$checkbox)"
+            if ($checkbox) { break }
+          }
+          if (-not $checkbox) { Write-Host 'EULA_CHECKBOX_FOUND=false'; exit 0 }
+
+          $pattern = $null
+          if ($checkbox.Element.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
+            $toggle = [System.Windows.Automation.TogglePattern]$pattern
+            if ($toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::Off) { $toggle.Toggle() }
+          }
+          Start-Sleep -Seconds 3
+
+          $elements = Get-Elements $proc.Id
+          $button = $elements |
+            Where-Object { $_.Id -eq 'ContinueButton' -and $_.Type -eq 'ControlType.Button' -and $_.Enabled } |
+            Select-Object -First 1
+          if (-not $button) { Write-Host 'INSTALL_BUTTON_READY=false'; exit 0 }
+
+          $pattern = $null
+          if ($button.Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+            ([System.Windows.Automation.InvokePattern]$pattern).Invoke()
+            Write-Host 'INSTALL_BUTTON_INVOKED=true'
+          }
+
+          $gs = $null
+          $status = $null
+          $deadline = (Get-Date).AddMinutes(7)
+          $poll = 0
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 10
+            $poll++
+            $gs = Get-AppxPackage -Name $env:GAMING_SERVICES_NAME -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $gs) {
+              Write-Host "GAMING_SERVICES_READY_POLL=$poll PRESENT=false"
+              continue
+            }
+            $status = $gs.Status.ToString()
+            Write-Host "GAMING_SERVICES_READY_POLL=$poll PRESENT=true STATUS=$status PACKAGE=$($gs.PackageFullName)"
+            if ($status -eq 'Ok') { break }
+          }
+
+          if (-not $gs -or $status -ne 'Ok') {
+            Write-Host 'GAMING_SERVICES_READY=false'
+            exit 0
+          }
+
+          Write-Host "GAMING_SERVICES_PRESENT=true PACKAGE=$($gs.PackageFullName)"
+          Write-Host "GAMING_SERVICES_PFN=$($gs.PackageFamilyName)"
+          Write-Host "GAMING_SERVICES_VERSION=$($gs.Version)"
+          Write-Host "GAMING_SERVICES_STATUS=$status"
+          Write-Host 'GAMING_SERVICES_READY=true'
+          "GAMING_SERVICES_VERSION=$($gs.Version)" | Out-File $env:GITHUB_ENV -Append
+
+          Get-Process -Name MinecraftInstaller,GamingRepair -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+
+      - name: Build packaged identity probe executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:GAMING_SERVICES_VERSION) { Write-Host 'STATIC_DEPENDENCY_PROBE_AVAILABLE=false'; exit 0 }
+
+          $root = Join-Path $env:RUNNER_TEMP 'XyronXStaticDependencyProbe'
+          $app = Join-Path $root 'app'
+          New-Item -ItemType Directory -Force -Path $app | Out-Null
+
+          @'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net8.0-windows10.0.26100.0</TargetFramework>
+              <RuntimeIdentifier>win-arm64</RuntimeIdentifier>
+              <PlatformTarget>ARM64</PlatformTarget>
+              <Nullable>enable</Nullable>
+              <ApplicationManifest>app.manifest</ApplicationManifest>
+            </PropertyGroup>
+          </Project>
+          '@ | Set-Content -Path (Join-Path $root 'Probe.csproj') -Encoding UTF8
+
+          @'
+          <?xml version="1.0" encoding="utf-8"?>
+          <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+            <assemblyIdentity version="1.0.0.0" name="XyronX.GamingServicesProbe" />
+            <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+              <security>
+                <requestedPrivileges>
+                  <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+                </requestedPrivileges>
+              </security>
+            </trustInfo>
+            <msix xmlns="urn:schemas-microsoft-com:msix.v1"
+                  publisher="CN=XyronX Test"
+                  packageName="XyronX.GamingServicesProbe"
+                  applicationId="Probe" />
+          </assembly>
+          '@ | Set-Content -Path (Join-Path $root 'app.manifest') -Encoding UTF8
+
+          @'
+          using System;
+          using System.Runtime.InteropServices;
+          using System.Text;
+
+          internal static class Program
+          {
+              [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+              private static extern int GetCurrentPackageFullName(ref uint packageFullNameLength, StringBuilder? packageFullName);
+
+              [DllImport("combase.dll")]
+              private static extern int RoInitialize(uint initType);
+
+              [DllImport("combase.dll")]
+              private static extern void RoUninitialize();
+
+              [DllImport("combase.dll", CharSet = CharSet.Unicode)]
+              private static extern int WindowsCreateString(string sourceString, int length, out IntPtr hstring);
+
+              [DllImport("combase.dll")]
+              private static extern int WindowsDeleteString(IntPtr hstring);
+
+              [DllImport("combase.dll")]
+              private static extern int RoGetActivationFactory(IntPtr activatableClassId, ref Guid iid, out IntPtr factory);
+
+              private static readonly Guid IID_IActivationFactory = new("00000035-0000-0000-C000-000000000046");
+              private static string Hex(int hr) => $"0x{unchecked((uint)hr):X8}";
+
+              private static int Probe(string className)
+              {
+                  int init = RoInitialize(1);
+                  IntPtr h = IntPtr.Zero;
+                  IntPtr factory = IntPtr.Zero;
+                  try
+                  {
+                      int hr = WindowsCreateString(className, className.Length, out h);
+                      if (hr < 0) return hr;
+                      Guid iid = IID_IActivationFactory;
+                      return RoGetActivationFactory(h, ref iid, out factory);
+                  }
+                  finally
+                  {
+                      if (factory != IntPtr.Zero) Marshal.Release(factory);
+                      if (h != IntPtr.Zero) WindowsDeleteString(h);
+                      if (init >= 0) RoUninitialize();
+                  }
+              }
+
+              public static int Main()
+              {
+                  Console.WriteLine("NO_STORE_METHODS_INVOKED=true");
+                  Console.WriteLine("NO_LICENSE_METHODS_INVOKED=true");
+                  Console.WriteLine("NO_PACKAGE_REQUESTS_SUBMITTED=true");
+                  Console.WriteLine("MICROSOFT_PRIVATE_CAPABILITIES_DECLARED=false");
+
+                  uint len = 0;
+                  int first = GetCurrentPackageFullName(ref len, null);
+                  Console.WriteLine($"CURRENT_PACKAGE_FIRST_RC={first}");
+                  if (first == 122 && len > 0)
+                  {
+                      var sb = new StringBuilder((int)len);
+                      int second = GetCurrentPackageFullName(ref len, sb);
+                      Console.WriteLine($"CURRENT_PACKAGE_SECOND_RC={second}");
+                      if (second == 0) Console.WriteLine($"CURRENT_PACKAGE_FULL_NAME={sb}");
+                  }
+
+                  string[] classes = {
+                      "Microsoft.GamePlatform.Services.Store",
+                      "Microsoft.GamePlatform.Services.Licensing",
+                      "Microsoft.GamePlatform.Services.PackageRequest",
+                      "Microsoft.GamePlatform.Services.PackageQueue",
+                      "Microsoft.GamePlatform.Services.ContentAccess",
+                      "Microsoft.GamePlatform.Services.Identity.XboxAuthManager"
+                  };
+
+                  foreach (string c in classes)
+                  {
+                      int hr = Probe(c);
+                      Console.WriteLine($"PACKAGED_CLASS={c} HRESULT={Hex(hr)} SUCCESS={hr >= 0}");
+                  }
+
+                  Console.WriteLine("FINAL_RESULT=Static uap17 packaged-identity activation probe completed without invoking Gaming Services Store, licensing, entitlement, or package-submission methods.");
+                  return 0;
+              }
+          }
+          '@ | Set-Content -Path (Join-Path $root 'Program.cs') -Encoding UTF8
+
+          Push-Location $root
+          dotnet restore
+          dotnet publish -c Release -r win-arm64 --self-contained false --no-restore -o $app
+          Pop-Location
+
+          "STATIC_PROBE_ROOT=$root" | Out-File $env:GITHUB_ENV -Append
+          "STATIC_PROBE_APP=$app" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Build sign and register sparse package with static GamingServices dependency
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if (-not $env:STATIC_PROBE_ROOT -or -not $env:STATIC_PROBE_APP) { Write-Host 'STATIC_DEPENDENCY_PACKAGE_AVAILABLE=false'; exit 0 }
+
+          $pkg = Join-Path $env:STATIC_PROBE_ROOT 'package'
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+
+          $version = $env:GAMING_SERVICES_VERSION
+          @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <Package IgnorableNamespaces="uap uap10 uap17 rescap"
+            xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+            xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+            xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+            xmlns:uap17="http://schemas.microsoft.com/appx/manifest/uap/windows10/17"
+            xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities">
+            <Identity Name="XyronX.GamingServicesProbe" Publisher="CN=XyronX Test" Version="1.0.0.0" ProcessorArchitecture="neutral" />
+            <Properties>
+              <DisplayName>XyronX GamingServices Probe</DisplayName>
+              <PublisherDisplayName>XyronX Test</PublisherDisplayName>
+              <Logo>Assets\storelogo.png</Logo>
+              <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
+            </Properties>
+            <Resources><Resource Language="en-us" /></Resources>
+            <Dependencies>
+              <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.26100.0" MaxVersionTested="10.0.26200.0" />
+              <uap17:PackageDependency Type="installAndRuntime"
+                Name="Microsoft.GamingServices"
+                Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
+                MinVersion="$version" />
+            </Dependencies>
+            <Capabilities>
+              <rescap:Capability Name="runFullTrust" />
+              <rescap:Capability Name="unvirtualizedResources" />
+            </Capabilities>
+            <Applications>
+              <Application Id="Probe" Executable="Probe.exe" uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App">
+                <uap:VisualElements AppListEntry="none" DisplayName="XyronX GamingServices Probe" Description="XyronX GamingServices Probe" BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" />
+              </Application>
+            </Applications>
+          </Package>
+          "@ | Set-Content -Path (Join-Path $pkg 'AppxManifest.xml') -Encoding UTF8
+
+          $makeappx = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Filter makeappx.exe -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Filter signtool.exe -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $makeappx -or -not $signtool) {
+            Write-Host 'WINDOWS_SDK_PACKAGING_TOOLS_PRESENT=false'
+            exit 0
+          }
+          Write-Host "MAKEAPPX=$($makeappx.FullName)"
+          Write-Host "SIGNTOOL=$($signtool.FullName)"
+
+          $msix = Join-Path $env:STATIC_PROBE_ROOT 'XyronX.GamingServicesProbe.msix'
+          & $makeappx.FullName pack /o /d $pkg /nv /p $msix
+          Write-Host "MAKEAPPX_EXIT_CODE=$LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $msix)) { exit 0 }
+
+          $cert = New-SelfSignedCertificate -Type Custom -Subject 'CN=XyronX Test' -KeyUsage DigitalSignature -FriendlyName 'XyronX GamingServices Probe' -CertStoreLocation 'Cert:\CurrentUser\My' -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3')
+          $password = ConvertTo-SecureString 'xyronx-probe-only' -AsPlainText -Force
+          $pfx = Join-Path $env:STATIC_PROBE_ROOT 'probe.pfx'
+          $cer = Join-Path $env:STATIC_PROBE_ROOT 'probe.cer'
+          Export-PfxCertificate -Cert $cert -FilePath $pfx -Password $password | Out-Null
+          Export-Certificate -Cert $cert -FilePath $cer | Out-Null
+          Import-Certificate -FilePath $cer -CertStoreLocation 'Cert:\CurrentUser\TrustedPeople' | Out-Null
+          "PROBE_CERT_THUMBPRINT=$($cert.Thumbprint)" | Out-File $env:GITHUB_ENV -Append
+
+          & $signtool.FullName sign /fd SHA256 /f $pfx /p 'xyronx-probe-only' $msix
+          Write-Host "SIGNTOOL_EXIT_CODE=$LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0) { exit 0 }
+
+          Write-Host 'STATIC_DEPENDENCY_TYPE=installAndRuntime'
+          Write-Host 'MICROSOFT_PRIVATE_CAPABILITIES_DECLARED=false'
+          Write-Host 'SPARSE_PACKAGE_STANDARD_CAPABILITIES=runFullTrust,unvirtualizedResources'
+
+          try {
+            Add-AppxPackage -Path $msix -ExternalLocation $env:STATIC_PROBE_APP -ErrorAction Stop
+            Write-Host 'STATIC_DEPENDENCY_PACKAGE_REGISTERED=true'
+            "STATIC_DEPENDENCY_REGISTERED=true" | Out-File $env:GITHUB_ENV -Append
+          } catch {
+            Write-Host 'STATIC_DEPENDENCY_PACKAGE_REGISTERED=false'
+            Write-Host "REGISTER_EXCEPTION_TYPE=$($_.Exception.GetType().FullName)"
+            Write-Host ("REGISTER_EXCEPTION_HRESULT=0x{0:X8}" -f ([uint32]$_.Exception.HResult))
+            Write-Host "REGISTER_EXCEPTION_MESSAGE=$($_.Exception.Message.Replace("`r",' ').Replace("`n",' '))"
+            Write-Host "REGISTER_FQID=$($_.FullyQualifiedErrorId)"
+          }
+
+      - name: Run packaged identity activation probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if ($env:STATIC_DEPENDENCY_REGISTERED -ne 'true') {
+            Write-Host 'PACKAGED_ACTIVATION_PROBE_SKIPPED=true'
+            exit 0
+          }
+
+          $registered = Get-AppxPackage -Name $env:PROBE_PACKAGE_NAME -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($registered) {
+            Write-Host "PROBE_PACKAGE_FULL_NAME=$($registered.PackageFullName)"
+            Write-Host "PROBE_PACKAGE_STATUS=$($registered.Status)"
+          }
+
+          $exe = Join-Path $env:STATIC_PROBE_APP 'Probe.exe'
+          Write-Host "PACKAGED_PROBE_EXE_PRESENT=$(Test-Path $exe)"
+          if (-not (Test-Path $exe)) { exit 0 }
+          & $exe
+
+      - name: Cleanup test identity package and certificate
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Get-AppxPackage -Name $env:PROBE_PACKAGE_NAME -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue
+
+          if ($env:PROBE_CERT_THUMBPRINT) {
+            Remove-Item "Cert:\CurrentUser\TrustedPeople\$env:PROBE_CERT_THUMBPRINT" -Force -ErrorAction SilentlyContinue
+            Remove-Item "Cert:\CurrentUser\My\$env:PROBE_CERT_THUMBPRINT" -Force -ErrorAction SilentlyContinue
+          }
+
+          Write-Host 'CLEANUP_ATTEMPTED=true'
+          Write-Host 'NO_STORE_METHODS_INVOKED=true'
+          Write-Host 'NO_LICENSE_METHODS_INVOKED=true'
+          Write-Host 'NO_PACKAGE_REQUESTS_SUBMITTED=true'
